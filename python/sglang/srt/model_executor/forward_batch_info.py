@@ -248,6 +248,12 @@ class ForwardBatch:
     # The sum of all sequence lengths
     seq_lens_sum: int
 
+    # sparse related compressed cache loc
+    sparse_16_loc: torch.Tensor = None
+    sparse_64_loc: torch.Tensor = None
+    token_num_sparse_16_cpu: torch.Tensor = None
+    token_num_sparse_64_cpu: torch.Tensor = None
+    
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
@@ -400,6 +406,32 @@ class ForwardBatch:
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    # For MiniCPM Sparse
+    sparse_page_table_bs: int = 0
+    sparse_bs_list: Optional[List[int]] = None
+    sparse_page_table_max_len: int = 0
+    old_bs_to_new_bs_range: Optional[List[int]] = None
+    sparse_max_seqlen_q: int = 0
+    sparse_bs_num: int = 0
+    sparse_page_table: Optional[torch.Tensor] = None
+    sparse_cu_seqlens_q_cpu: Optional[torch.Tensor] = None
+
+    seqlen_q_sparse_bs: Optional[List[int]] = None
+    seqlen_q_sparse_bs_tensor: Optional[torch.Tensor] = None
+    cu_seqlens_q_sparse_bs: Optional[torch.Tensor] = None
+    q_shape_sparse_bs: Optional[int] = None
+    token_to_bs: Optional[torch.Tensor] = None
+    token_pos_in_bs: Optional[torch.Tensor] = None
+    sparse_idx: Optional[List[int]] = None
+
+    sparse_cache_lens: Optional[torch.Tensor] = None
+    sparse_cu_seqlens_q: Optional[torch.Tensor] = None
+    sparse_cu_seqlens_kv: Optional[torch.Tensor] = None
+
+    # decode
+    sparse_cache_seqlens_cpu: Optional[torch.Tensor] = None
+    sparse_cache_seqlens: Optional[torch.Tensor] = None
+
     @classmethod
     def init_new(
         cls,
@@ -413,6 +445,10 @@ class ForwardBatch:
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            sparse_16_loc=batch.sparse_16_loc,
+            sparse_64_loc=batch.sparse_64_loc,
+            token_num_sparse_16_cpu=batch.token_num_sparse_16_cpu,
+            token_num_sparse_64_cpu=batch.token_num_sparse_64_cpu,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
