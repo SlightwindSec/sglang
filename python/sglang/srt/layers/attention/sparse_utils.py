@@ -4,6 +4,16 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from functools import lru_cache
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
+
+from sglang.srt.layers.attention.sparse_kernels import (
+    compress_k_complete_kernel,
+)
+import triton
+
 @lru_cache(maxsize=16)
 def calc_chunks_with_stride(cu_seqlen, chunk_size, kernel_stride):
     """
@@ -21,7 +31,7 @@ def calc_chunks_with_stride(cu_seqlen, chunk_size, kernel_stride):
 
     # 2. Compute the start positions of chunks for each sequence (with stride)
     max_seq_len = torch.max(batch_sizes)
-    max_num_chunks_per_seq = (max_seq_len - chunk_size) // kernel_stride + 1
+    max_num_chunks_per_seq = torch.maximum((max_seq_len - chunk_size) // kernel_stride + 1, torch.tensor(0, device=max_seq_len.device))
     chunk_start_offsets = torch.arange(0, max_num_chunks_per_seq * kernel_stride, kernel_stride, device=cu_seqlen.device)
     seq_starts = cu_seqlen[:-1]
     chunk_start_in_seq = seq_starts[:, None] + chunk_start_offsets[None, :]  # [batch_size, max_num_chunks_per_seq]
@@ -170,6 +180,98 @@ class CompressK(torch.nn.Module):
         self.kernel_stride = kernel_stride
 
     def forward(self, k: torch.Tensor, cu_seqlens):
+        compressed_k_triton, cu_seqlens_compressed_trition = self.forward_triton(k, cu_seqlens)
+
+        # compare the result with the original forward
+        if False:
+            compressed_k_original, cu_seqlens_compressed_original = self.forward_original(k, cu_seqlens)
+            if compressed_k_triton.numel() > 0:
+                print("compressed_k_triton.shape", compressed_k_triton.shape)
+                print("compressed_k_original.shape", compressed_k_original.shape)
+                print(torch.abs(compressed_k_triton - compressed_k_original).max())
+                assert(torch.abs(compressed_k_triton - compressed_k_original).max() < 1e3)
+                assert(torch.equal(cu_seqlens_compressed_trition, cu_seqlens_compressed_original))
+
+        return compressed_k_triton, cu_seqlens_compressed_trition
+
+
+    def forward_triton(self, k: torch.Tensor, cu_seqlens):
+        """
+        Forward pass for compressing the key (K) tensor using complete single-kernel implementation.
+        
+        This method uses compress_k_complete_triton which combines chunk calculation and key compression
+        into a single self-contained Triton kernel, eliminating intermediate buffers and function calls
+        while maintaining identical functionality and CUDA graph compatibility.
+        
+        Args:
+            k (torch.Tensor): Input key tensor of shape (total_seq_len, num_heads, head_dim).
+            cu_seqlens (torch.Tensor): Cumulative sequence lengths for each sample in batch,
+                                      typically used for handling variable-length sequences.
+                                      Shape: [batch_size + 1]
+        
+        Returns:
+            compressed_k (torch.Tensor): Compressed key tensor of shape [num_chunks, num_heads, head_dim].
+                                      Each chunk represents mean-pooled values from kernel_size consecutive tokens.
+            cu_seqlens_compressed (torch.Tensor): Updated cumulative sequence lengths after compression,
+                                                shape [batch_size + 1], dtype int32.
+        """
+        # ==============================================================================
+        # SINGLE KERNEL APPROACH - All computation done in one kernel
+        # ==============================================================================
+        
+        # Derive parameters for explicit passing to self-contained kernel
+        # TODO these two params should be passed in by arguments
+        actual_batch_size = 1
+        max_context_length = 20480  # Model's maximum context length for conservative allocation
+        
+        # ==============================================================================
+        # BUFFER ALLOCATION
+        # ==============================================================================
+        
+        # Use provided explicit parameters for buffer allocation
+        max_chunks_per_seq = max(0, (max_context_length - self.kernel_size) // self.kernel_stride + 1)
+        max_total_chunks = actual_batch_size * max_chunks_per_seq
+        
+        # Allocate maximum possible output buffers
+        compressed_k = torch.zeros(
+            max_total_chunks, self.head_num_k, self.head_dim, 
+            dtype=k.dtype, device=k.device
+        )
+        cu_seqlens_compressed = torch.zeros(actual_batch_size + 1, dtype=torch.int32, device=k.device)
+        cu_seqlens_compressed[0] = 0  # Initialize
+        
+        # Launch single kernel that does everything
+        BLOCK_SIZE = triton.next_power_of_2(self.head_dim)
+        grid = (actual_batch_size, max_chunks_per_seq, self.head_num_k)
+        
+        compress_k_complete_kernel[grid](
+            k,
+            cu_seqlens,
+            compressed_k,
+            cu_seqlens_compressed,
+            actual_batch_size,
+            max_chunks_per_seq,
+            self.head_num_k,
+            self.head_dim,
+            self.kernel_size,
+            self.kernel_stride,
+            BLOCK_SIZE,
+        )
+        
+        # ==============================================================================
+        # RESULT TRIMMING
+        # ==============================================================================
+        
+        # Get actual number of chunks and trim output
+        actual_total_chunks = cu_seqlens_compressed[-1].item()
+        compressed_k = compressed_k[:actual_total_chunks]
+        
+        # ==============================================================================
+        # RETURN RESULTS
+        # ==============================================================================
+        return compressed_k, cu_seqlens_compressed
+
+    def forward_original(self, k: torch.Tensor, cu_seqlens):
         """
         Forward pass for compressing the key (K) tensor.
         Args:
@@ -197,7 +299,7 @@ def _get_unpad_data(attention_mask):
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
     max_seqlen_in_batch = seqlens_in_batch.max().item()
-    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.torch.int32), (1, 0))
+    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
     return (
         indices,
         cu_seqlens,
@@ -239,7 +341,7 @@ def batched_gather(a, cu_seqlen_q, select):
 
     return a[index]
 
-def get_compress_k(key_states, attention_mask, 
+def original_get_compress_k(key_states, attention_mask, 
                     layer,
                     forward_batch,
                     compress_k1: CompressK,
@@ -315,3 +417,135 @@ def get_compress_k(key_states, attention_mask,
     compressed_cu_seqlens2 = torch.tensor([0, compressed_k2.shape[0]], device=compressed_k2.device, dtype=torch.int32)
 
     return compressed_k1, compressed_cu_seqlens, compressed_k2, compressed_cu_seqlens2
+
+
+
+def new_get_compress_k(key_states, attention_mask, 
+                    layer,
+                    forward_batch,
+                    compress_k: CompressK,
+                    compress_k2: CompressK,
+                    metadata: "FlashAttentionMetadata",
+                    batch_id = 0):
+    # only support batch size 1 for now
+
+    # k1 stride is 16, window is 32
+    # k2 stride is 64, windiw is 128
+    k1_stride = 16
+    k1_l = 32
+    k2_stride = 64
+    k2_l = 128
+
+    #################### prepare arguments ##############################
+    # TODO in summary, the arguments needed are:
+    # key_cache [-1, head_num, head_size]
+    # metadata.cu_seqlens_q [batch_size + 1]
+    # metadata.cu_seqlens_k [batch_size + 1]
+    # token_table [token_num]: the pre-allocated locs of normal tokens
+    # k1_loc [total_compress_k1_token_num]: the pre-allocated locs of compress k1 tokens
+    # k2_loc [total_compress_k2_token_num]: the pre-allocated locs of compress k2 tokens
+    # theses arguments should be dirrectly passed in
+
+    req_id = forward_batch.req_pool_indices[batch_id]
+    req_to_token_pool = forward_batch.req_to_token_pool
+
+    token_to_kv_pool = forward_batch.token_to_kv_pool
+    
+    key_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
+    key_cache = key_cache.view(-1, layer.tp_k_head_num, layer.head_dim)
+
+    token_table = req_to_token_pool.req_to_token[req_id]
+
+    k1_loc = req_to_token_pool.req_to_sparse_k1_token[req_id]
+    k2_loc = req_to_token_pool.req_to_sparse_k2_token[req_id]
+    ##################### start computation ######################
+
+    # token_nums = history_lens + input_lens
+    token_nums = metadata.cu_seqlens_k[1:] - metadata.cu_seqlens_k[:-1]
+    token_num = token_nums[batch_id]
+
+    input_lens = metadata.cu_seqlens_q[1:] - metadata.cu_seqlens_q[:-1]
+    input_len = input_lens[batch_id]
+
+    history_lens = token_nums - input_lens
+    history_len = history_lens[batch_id]
+
+    # history compressed tokens
+    history_compress_k1_token_nums = torch.maximum((history_lens - k1_l) // k1_stride + 1, torch.tensor(0,device=history_lens.device))
+    history_compress_k2_token_nums = torch.maximum((history_lens - k2_l) // k2_stride + 1, torch.tensor(0,device=history_lens.device))
+    history_compress_k1_token_num = history_compress_k1_token_nums[batch_id]
+    history_compress_k2_token_num = history_compress_k2_token_nums[batch_id]
+    
+    # new tokens
+    k1_new_seq_lens = token_nums - history_compress_k1_token_nums * k1_stride
+    k2_new_seq_lens = token_nums - history_compress_k2_token_nums * k2_stride
+    k1_new_seq_len = k1_new_seq_lens[batch_id]
+    k2_new_seq_len = k2_new_seq_lens[batch_id]
+
+    k1_cu_seqlens = torch.tensor([0, k1_new_seq_len], dtype=torch.int32, device=key_cache.device)
+    k2_cu_seqlens = torch.tensor([0, k2_new_seq_len], dtype=torch.int32, device=key_cache.device)
+
+    # new compressed tokens
+    new_compress_k1_token_nums = torch.maximum((k1_new_seq_lens - k1_l) // k1_stride + 1, torch.tensor(0,device=k1_new_seq_lens.device))
+    new_compress_k2_token_nums = torch.maximum((k2_new_seq_lens - k2_l) // k2_stride + 1, torch.tensor(0,device=k2_new_seq_lens.device))
+    new_compress_k1_token_num = new_compress_k1_token_nums[batch_id]
+    new_compress_k2_token_num = new_compress_k2_token_nums[batch_id]
+
+    # cum sum of new compressed tokens
+    cu_new_compress_k1_token_nums = F.pad(torch.cumsum(new_compress_k1_token_nums, dim = 0, dtype=torch.int32), (1,0))
+    cu_new_compress_k2_token_nums = F.pad(torch.cumsum(new_compress_k2_token_nums, dim = 0, dtype=torch.int32), (1,0))
+
+    # total compressed tokens
+    total_compress_k1_token_nums = history_compress_k1_token_nums + new_compress_k1_token_nums
+    total_compress_k2_token_nums = history_compress_k2_token_nums + new_compress_k2_token_nums
+    total_compress_k1_token_num = total_compress_k1_token_nums[batch_id]
+    total_compress_k2_token_num = total_compress_k2_token_nums[batch_id]
+
+
+    k1_index = token_table[(history_compress_k1_token_num * k1_stride):token_num]
+    k2_index = token_table[(history_compress_k2_token_num * k2_stride):token_num]
+
+    sparse_16_loc_one_batch = k1_loc[history_compress_k1_token_num : total_compress_k1_token_num]
+    sparse_64_loc_one_batch = k2_loc[history_compress_k2_token_num : total_compress_k2_token_num]
+
+    k1 = key_cache[k1_index, :, :]
+
+    #__import__('fpdb').ForkedPdb().set_trace()
+    new_compressed_k1, new_compressed_cu_seqlens = compress_k(k1, k1_cu_seqlens)
+    token_to_kv_pool.set_kv_buffer(layer, sparse_16_loc_one_batch, new_compressed_k1, new_compressed_k1, None, None)
+    
+    full_compressed_k1 = key_cache[k1_loc[:total_compress_k1_token_num]]
+    full_compressed_cu_seqlens = torch.tensor([0, total_compress_k1_token_num], device=full_compressed_k1.device, dtype=torch.int32)
+
+    k2 = key_cache[k2_index, :, :]
+
+    new_compressed_k2, new_compressed_cu_seqlens2 = compress_k2(k2, k2_cu_seqlens)
+    token_to_kv_pool.set_kv_buffer(layer, sparse_64_loc_one_batch, new_compressed_k2, new_compressed_k2, None, None)
+    
+    full_compressed_k2 = key_cache[k2_loc[:total_compress_k2_token_num]]
+    full_compressed_cu_seqlens2 = torch.tensor([0, total_compress_k2_token_num], device=full_compressed_k2.device, dtype=torch.int32)
+    
+    return full_compressed_k1, full_compressed_cu_seqlens, full_compressed_k2, full_compressed_cu_seqlens2
+
+
+def get_compress_k(key_states, attention_mask, 
+                    layer,
+                    forward_batch,
+                    compress_k1: CompressK,
+                    compress_k2: CompressK,
+                    metadata: "FlashAttentionMetadata",
+                    batch_id = 0):
+        new_results = new_get_compress_k(key_states, attention_mask, layer, forward_batch, compress_k1, compress_k2, metadata, batch_id)
+        if False:
+            original_results = original_get_compress_k(key_states, attention_mask, layer, forward_batch, compress_k1, compress_k2, batch_id)
+            #__import__('fpdb').ForkedPdb().set_trace()
+            if (original_results[0].numel() > 0):
+                assert(torch.equal(original_results[0], new_results[0]))
+            if (original_results[1].numel() > 0):
+                assert(torch.equal(original_results[1], new_results[1]))
+            if (original_results[2].numel() > 0):
+                assert(torch.equal(original_results[2], new_results[2]))
+            if (original_results[3].numel() > 0):
+                assert(torch.equal(original_results[3], new_results[3]))
+        return new_results
+
