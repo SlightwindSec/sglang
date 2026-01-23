@@ -562,7 +562,7 @@ def get_compress_k(key_states,
 
 def compress_k_core_new(
         full_compressed_k, # output
-        layer, batch, k_stride, token_to_kv_pool, key_cache, token_table, compressed_k_table, new_k_token_nums, cu_new_k_token_nums, history_compress_k_token_nums, cu_new_compress_k_token_nums, new_compress_k_token_nums, total_compress_k_token_nums, cu_total_compress_k_token_nums, kernel_size, kernel_stride, max_context_length):
+        layer, batch, k_stride, key_cache, token_table, compressed_k_table, new_k_token_nums, cu_new_k_token_nums, history_compress_k_token_nums, cu_new_compress_k_token_nums, new_compress_k_token_nums, total_compress_k_token_nums, cu_total_compress_k_token_nums, kernel_size, kernel_stride, max_context_length):
 
     head_num_k = key_cache.shape[1]
     head_dim = key_cache.shape[2]
@@ -641,56 +641,29 @@ def get_compress_k_v2(layer,
     # k2_table [batch_size, total_compress_k2_token_num]: the pre-allocated locs of compress k2 tokens
     # theses arguments should be dirrectly passed in
 
-    req_ids = forward_batch.req_pool_indices
-    req_to_token_pool = forward_batch.req_to_token_pool
-
-    token_to_kv_pool = forward_batch.token_to_kv_pool
-    
-    key_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
+    # get key cache ptr, zero over head
+    key_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
     key_cache = key_cache.view(-1, layer.tp_k_head_num, layer.head_dim)
 
-    token_table = req_to_token_pool.req_to_token[req_ids]
-
-    k1_table = req_to_token_pool.req_to_sparse_k1_token[req_ids]
-    k2_table = req_to_token_pool.req_to_sparse_k2_token[req_ids]
     ##################### prepare of computation ######################
 
-    # token_nums = history_lens + input_lens
-    token_nums = metadata.cu_seqlens_k[1:] - metadata.cu_seqlens_k[:-1]
-    input_lens = metadata.cu_seqlens_q[1:] - metadata.cu_seqlens_q[:-1]
-    history_lens = token_nums - input_lens
-
-    # history compressed tokens
-    history_compress_k1_token_nums = torch.maximum((history_lens - k1_l) // k1_stride + 1, torch.zeros(1,device=history_lens.device,dtype=torch.int32))
-    history_compress_k2_token_nums = torch.maximum((history_lens - k2_l) // k2_stride + 1, torch.zeros(1,device=history_lens.device,dtype=torch.int32))
-
-    # new tokens
-    new_k1_token_nums = token_nums - history_compress_k1_token_nums * k1_stride
-    new_k2_token_nums = token_nums - history_compress_k2_token_nums * k2_stride
-
-    cu_new_k1_token_nums = F.pad(torch.cumsum(new_k1_token_nums, dim=0, dtype=torch.int32), (1, 0))
-    cu_new_k2_token_nums = F.pad(torch.cumsum(new_k2_token_nums, dim=0, dtype=torch.int32), (1, 0))
-
-    # new compressed tokens
-    new_compress_k1_token_nums = torch.maximum((new_k1_token_nums - k1_l) // k1_stride + 1, torch.zeros(1,device=new_k1_token_nums.device,dtype=torch.int32))
-    new_compress_k2_token_nums = torch.maximum((new_k2_token_nums - k2_l) // k2_stride + 1, torch.zeros(1,device=new_k2_token_nums.device,dtype=torch.int32))
-
-    # cum sum of new compressed tokens
-    cu_new_compress_k1_token_nums = F.pad(torch.cumsum(new_compress_k1_token_nums, dim = 0, dtype=torch.int32), (1,0))
-    cu_new_compress_k2_token_nums = F.pad(torch.cumsum(new_compress_k2_token_nums, dim = 0, dtype=torch.int32), (1,0))
-
-    # total compressed tokens
-    total_compress_k1_token_nums = history_compress_k1_token_nums + new_compress_k1_token_nums
-    total_compress_k2_token_nums = history_compress_k2_token_nums + new_compress_k2_token_nums
-
-    cu_total_compress_k1_token_nums = F.pad(torch.cumsum(total_compress_k1_token_nums, dim = 0, dtype=torch.int32), (1, 0))
-    cu_total_compress_k2_token_nums = F.pad(torch.cumsum(total_compress_k2_token_nums, dim = 0, dtype=torch.int32), (1, 0))
-
     # deal with k1
-    compress_k_core_new(full_compressed_k1, layer, batch, k1_stride, token_to_kv_pool, key_cache, token_table, k1_table, new_k1_token_nums, cu_new_k1_token_nums, history_compress_k1_token_nums, cu_new_compress_k1_token_nums, new_compress_k1_token_nums, total_compress_k1_token_nums, cu_total_compress_k1_token_nums, k1_l, k1_stride, max_context_length)
+    compress_k_core_new(full_compressed_k1, layer, batch, k1_stride, 
+                        key_cache, metadata.page_table, metadata.k1_table, 
+                        metadata.new_k1_token_nums, metadata.cu_new_k1_token_nums,
+                        metadata.history_compress_k1_token_nums, 
+                        metadata.cu_new_compress_k1_token_nums, metadata.new_compress_k1_token_nums, 
+                        metadata.total_compress_k1_token_nums, metadata.cu_total_compress_k1_token_nums, 
+                        k1_l, k1_stride, max_context_length)
 
     # deal with k2
-    compress_k_core_new(full_compressed_k2, layer, batch, k2_stride, token_to_kv_pool, key_cache, token_table, k2_table, new_k2_token_nums, cu_new_k2_token_nums, history_compress_k2_token_nums, cu_new_compress_k2_token_nums, new_compress_k2_token_nums, total_compress_k2_token_nums, cu_total_compress_k2_token_nums, k2_l, k2_stride, max_context_length)
+    compress_k_core_new(full_compressed_k2, layer, batch, k2_stride, 
+                        key_cache, metadata.page_table, metadata.k2_table, 
+                        metadata.new_k2_token_nums, metadata.cu_new_k2_token_nums, 
+                        metadata.history_compress_k2_token_nums, 
+                        metadata.cu_new_compress_k2_token_nums, metadata.new_compress_k2_token_nums, 
+                        metadata.total_compress_k2_token_nums, metadata.cu_total_compress_k2_token_nums, 
+                        k2_l, k2_stride, max_context_length)
 
     return
 
