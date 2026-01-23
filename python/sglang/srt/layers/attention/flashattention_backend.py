@@ -129,6 +129,10 @@ class FlashAttentionMetadata:
     total_compress_k2_token_nums: Optional[torch.Tensor] = None
     cu_total_compress_k2_token_nums: Optional[torch.Tensor] = None
     
+    # add for chunk prefill
+    sparse_bs_list = None
+    old_bs_to_new_bs_range = None
+    sparse_cu_seqlens_q_cpu = None
     
     
 
@@ -646,7 +650,7 @@ class FlashAttentionBackend(AttentionBackend):
             # this is the "max" kv_len used to calc attn for sparse req
             sparse_topk_max_token_num = self.sparse_topk * self.block_size
             
-            sparse_bs_list = []
+            metadata.sparse_bs_list = []
             max_sparse_cache_len = -1
             # batch size after trans prefill to (token_num * k_head_num) decode
             # [0, 2, 4, 100] mean that, after trans, sparse_page_table_bs is 100
@@ -654,40 +658,40 @@ class FlashAttentionBackend(AttentionBackend):
             # old_bs[1] -> new_bs[2,3]
             # old_bs[2] -> new_bs[4 : 100]
             sparse_page_table_bs = 0
-            old_bs_to_new_bs_range = [0 for _ in range(bs + 1)]
+            metadata.old_bs_to_new_bs_range = [0 for _ in range(bs + 1)]
             
             metadata.sparse_max_seq_len_q = 1 # since we treat sparse prefill as multi-batch decode
 
             for i in range(bs):
                 if forward_batch.seq_lens_cpu[i] >= self.dense_len:
                     max_sparse_cache_len = max(max_sparse_cache_len, sparse_topk_max_token_num)
-                    sparse_bs_list.append(i)
+                    metadata.sparse_bs_list.append(i)
                     sparse_page_table_bs += forward_batch.extend_seq_lens_cpu[i] * self.head_group_num # each head_group as a batch
-                    old_bs_to_new_bs_range[i + 1] = old_bs_to_new_bs_range[i] + self.head_group_num * forward_batch.extend_seq_lens_cpu[i]
+                    metadata.old_bs_to_new_bs_range[i + 1] = metadata.old_bs_to_new_bs_range[i] + self.head_group_num * forward_batch.extend_seq_lens_cpu[i]
                 else:
                     max_sparse_cache_len = max(max_sparse_cache_len, forward_batch.extend_seq_lens_cpu[i])
                     sparse_page_table_bs += self.head_group_num # each head_group as a batch
-                    old_bs_to_new_bs_range[i + 1] = old_bs_to_new_bs_range[i] + self.head_group_num
+                    metadata.old_bs_to_new_bs_range[i + 1] = metadata.old_bs_to_new_bs_range[i] + self.head_group_num
                     metadata.sparse_max_seq_len_q = max(metadata.sparse_max_seq_len_q, forward_batch.extend_seq_lens_cpu[i])
 
-            forward_batch.sparse_batch_size = len(sparse_bs_list)
-            metadata.sparse_page_table = torch.zeros((sparse_page_table_bs, self.num_sparse_topk_tokens), dtype=metadata.page_table.dtype, device=metadata.page_table.device)
-            sparse_cu_seqlens_q_cpu = torch.zeros((sparse_page_table_bs + 1), dtype=cu_seqlens_q.dtype, device='cpu')
+            forward_batch.sparse_batch_size = len(metadata.sparse_bs_list)
+            metadata.sparse_page_table = torch.zeros((sparse_page_table_bs, max_sparse_cache_len), dtype=metadata.page_table.dtype, device=metadata.page_table.device)
+            metadata.sparse_cu_seqlens_q_cpu = torch.zeros((sparse_page_table_bs + 1), dtype=cu_seqlens_q.dtype, device='cpu')
             
             pt = 0
             for i in range(bs):
                 if forward_batch.seq_lens_cpu[i] >= self.dense_len:
                     for _ in range(forward_batch.extend_seq_lens_cpu[i] * self.head_group_num):
-                        sparse_cu_seqlens_q_cpu[pt + 1] = sparse_cu_seqlens_q_cpu[pt] + 1 
+                        metadata.sparse_cu_seqlens_q_cpu[pt + 1] = metadata.sparse_cu_seqlens_q_cpu[pt] + 1 
                         pt += 1
                 else:
                     for _ in range(self.head_group_num):
-                        sparse_cu_seqlens_q_cpu[pt + 1] = sparse_cu_seqlens_q_cpu[pt] + forward_batch.extend_seq_lens_cpu[i]
+                        metadata.sparse_cu_seqlens_q_cpu[pt + 1] = metadata.sparse_cu_seqlens_q_cpu[pt] + forward_batch.extend_seq_lens_cpu[i]
                         pt += 1
             assert pt == sparse_page_table_bs, "sparse_page_table_bs {} vs pt {}".format(sparse_page_table_bs, pt)
-            metadata.sparse_cu_seqlens_q = sparse_cu_seqlens_q_cpu.to(device=cu_seqlens_q.device)
+            metadata.sparse_cu_seqlens_q = metadata.sparse_cu_seqlens_q_cpu.to(device=cu_seqlens_q.device)
             
-            seqlen_q_sparse_bs = (metadata.cu_seqlens_q.diff())[sparse_bs_list].tolist()
+            seqlen_q_sparse_bs = (metadata.cu_seqlens_q.diff())[metadata.sparse_bs_list].tolist()
             metadata.seqlen_k_sparse_bs_tensor = torch.tensor(seqlen_q_sparse_bs, dtype=torch.int32, device=metadata.cu_seqlens_q.device) + forward_batch.extend_prefix_lens
 
 
@@ -705,8 +709,8 @@ class FlashAttentionBackend(AttentionBackend):
                     [(idx + 1 + forward_batch.extend_prefix_lens_cpu[i]) for idx in range(seqlen_q_sparse_bs[i])], dtype=metadata.token_to_bs.dtype, device=metadata.token_to_bs.device)
 
             forward_batch.sparse_idx = []
-            for sparse_bs in sparse_bs_list:
-                forward_batch.sparse_idx.extend(range(old_bs_to_new_bs_range[sparse_bs] , old_bs_to_new_bs_range[sparse_bs + 1]))
+            for sparse_bs in metadata.sparse_bs_list:
+                forward_batch.sparse_idx.extend(range(metadata.old_bs_to_new_bs_range[sparse_bs] , metadata.old_bs_to_new_bs_range[sparse_bs + 1]))
         else:
             cache_seqlens = metadata.cache_seqlens_int32
             page_table = metadata.page_table
@@ -1450,7 +1454,27 @@ class FlashAttentionBackend(AttentionBackend):
 
         q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num // 2, layer.head_dim)
         if forward_batch.sparse_batch_size < bs:
-            assert not self.enable_cuda_graph or forward_batch.sparse_batch_size == 0, "bs must be all dense or all sparse for cuda graph support"
+            # copy dense page table for dense bs
+            sparse_page_table_shape_1 = metadata.sparse_page_table.shape[1]
+            dense_bs_list = [i for i in range(bs) if i not in metadata.sparse_bs_list]
+            for dense_bs in dense_bs_list:
+                kv_len = forward_batch.seq_lens_cpu[dense_bs]
+                sparse_page_table_idx_start = metadata.old_bs_to_new_bs_range[dense_bs]
+                sparse_page_table_idx_end = metadata.old_bs_to_new_bs_range[dense_bs + 1]
+                assert sparse_page_table_idx_end - sparse_page_table_idx_start == 2, "dense bs should have 2 head_group"
+
+                ps = metadata.sparse_cu_seqlens_q_cpu[sparse_page_table_idx_start]
+                len_ = metadata.sparse_cu_seqlens_q_cpu[sparse_page_table_idx_start + 1] - ps
+                assert len_ == forward_batch.extend_seq_lens_cpu[dense_bs], "dense bs seqlen mismatch {} vs {}".format(
+                    len_, forward_batch.extend_seq_lens_cpu[dense_bs]
+                )
+                t = q_reshaped[ps : ps + 2 * len_, :, :].clone()
+                q_reshaped[ps : ps + len_, :, :] = t[0::2, :, :]
+                q_reshaped[ps + len_ : ps + 2 * len_, :, :] = t[1::2, :, :]
+
+                metadata.sparse_page_table[sparse_page_table_idx_start, :] = page_table[dense_bs, : kv_len] * 2
+                metadata.sparse_page_table[sparse_page_table_idx_start + 1, :] = page_table[dense_bs, : kv_len] * 2 + 1
+            # assert not self.enable_cuda_graph or forward_batch.sparse_batch_size == 0, "bs must be all dense or all sparse for cuda graph support"
 
         metadata.sparse_cache_seqlens_int32 = (metadata.sparse_page_table != 0).sum(dim=1).to(dtype=cache_seqlens.dtype, device=cache_seqlens.device)
 
@@ -1492,7 +1516,22 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
         if forward_batch.sparse_batch_size < bs:
-            assert not self.enable_cuda_graph or forward_batch.sparse_batch_size == 0, "bs must be all dense or all sparse for cuda graph support"
+            # assert not self.enable_cuda_graph or forward_batch.sparse_batch_size == 0, "bs must be all dense or all sparse for cuda graph support"
+            sparse_page_table_shape_1 = metadata.sparse_page_table.shape[1]
+            dense_bs_list = [i for i in range(bs) if i not in metadata.sparse_bs_list]
+            for dense_bs in dense_bs_list:
+                sparse_page_table_idx_start = metadata.old_bs_to_new_bs_range[dense_bs]
+                sparse_page_table_idx_end = metadata.old_bs_to_new_bs_range[dense_bs + 1]
+                assert sparse_page_table_idx_end - sparse_page_table_idx_start == 2, "dense bs should have 2 head_group"
+
+                ps = metadata.sparse_cu_seqlens_q_cpu[sparse_page_table_idx_start]
+                len_ = metadata.sparse_cu_seqlens_q_cpu[sparse_page_table_idx_start + 1] - ps
+                assert len_ == forward_batch.extend_seq_lens_cpu[dense_bs], "dense bs seqlen mismatch {} vs {}".format(
+                    len_, forward_batch.extend_seq_lens_cpu[dense_bs]
+                )
+                t = result[ps : ps + 2 * len_, :, :].clone()
+                result[ps:ps + 2 * len_:2, :, :] = t[0 : len_, :, :]
+                result[ps + 1 : ps + 2 * len_:2, :, :] = t[len_ : 2 * len_, :, :]
 
         attn_output = result.reshape(q.shape[0], layer.tp_q_head_num * layer.head_dim)
         return attn_output
@@ -1861,10 +1900,10 @@ class FlashAttentionBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
                 
-                if layer.layer_id == 0 and forward_batch.seq_lens_cpu[0] == 8193:
-                    print("profile start")
-                    torch.cuda.synchronize()
-                    torch.cuda.cudart().cudaProfilerStart()
+                # if layer.layer_id == 0 and forward_batch.seq_lens_cpu[0] == 8193:
+                #     print("profile start")
+                #     torch.cuda.synchronize()
+                #     torch.cuda.cudart().cudaProfilerStart()
                 # if self.enable_cuda_graph:
                 topk_idx = self.get_topk_for_sparse(q_reshaped.unsqueeze(0), 
                                                     k.unsqueeze(0), 
@@ -1882,10 +1921,10 @@ class FlashAttentionBackend(AttentionBackend):
                             cache_seqlens
                 ).reshape(-1, self.num_sparse_topk_tokens)
                 
-                if layer.layer_id == 0 and forward_batch.seq_lens_cpu[0] == 8193:
-                    print("profile end")
-                    torch.cuda.synchronize()
-                    torch.cuda.cudart().cudaProfilerStop()
+                # if layer.layer_id == 0 and forward_batch.seq_lens_cpu[0] == 8193:
+                #     print("profile end")
+                #     torch.cuda.synchronize()
+                #     torch.cuda.cudart().cudaProfilerStop()
                 
                 # sparse_page_table = self.mock_sparse_page_table[layer.layer_id]
                 metadata.sparse_page_table[: 2 * bs, :self.num_sparse_topk_tokens] = sparse_page_table[:, :self.num_sparse_topk_tokens]
