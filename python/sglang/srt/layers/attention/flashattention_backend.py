@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+import time
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -3010,62 +3011,138 @@ class FlashAttentionBackend(AttentionBackend):
                     # sparse_cache_lens
                     
                     # sparse_page_table this update per layer
+                    # if seq_lens[0] == 8193:
+                    # torch.cuda.synchronize()
+                    # start = time.perf_counter()
+                    #     torch.cuda.cudart().cudaProfilerStart()
                     
-                    for i in range(bs):
-                        cache_len = seq_lens[i].item()
-                        sparse_cache_seqlen = (
-                            self.num_sparse_topk_tokens
-                            if cache_len % self.block_size == 0
-                            else (self.sparse_topk - 1) * self.block_size + (cache_len % self.block_size)
-                        )
-                        metadata.sparse_cache_seqlens_int32[2 * i] = sparse_cache_seqlen
-                        metadata.sparse_cache_seqlens_int32[2 * i + 1] = sparse_cache_seqlen
-                        
+                    mod_block_size_cpu = seq_lens.to(device="cpu") % self.block_size
+                    cu_seqlens_k_cpu = metadata.cu_seqlens_k.to(device="cpu")
+                    cu_seqlens_q_cpu = metadata.cu_seqlens_q.to(device="cpu")
                     
-                    metadata.sparse_cu_seqlens_k[1:].copy_(torch.cumsum(metadata.sparse_cache_seqlens_int32, dim=0, dtype=torch.int32))
+                    sparse_cache_seqlens_cpu = torch.where(
+                        mod_block_size_cpu == 0,
+                        self.num_sparse_topk_tokens,
+                        (self.sparse_topk - 1) * self.block_size + mod_block_size_cpu
+                    )
                     
-                    seqlens_k1 = (metadata.cache_seqlens_int32 - self.k1_kernel_size) // self.k1_kernel_stride + 1
-                    seqlens_k2 = (metadata.cache_seqlens_int32 - self.k2_kernel_size) // self.k2_kernel_stride + 1
+                    sparse_cache_seqlens_int32_cpu = torch.repeat_interleave(sparse_cache_seqlens_cpu, 2)
                     
-                    metadata.max_seq_len_k1 = seqlens_k1.max().item()
-                    metadata.max_seq_len_k2 = seqlens_k2.max().item()
-                    # metadata.max_seq_len_k2 = assume_k2_len
-                    metadata.cu_seqlens_k1[1:].copy_(torch.cumsum(seqlens_k1, dim=0, dtype=torch.int32))
-                    metadata.cu_seqlens_k2[1:].copy_(torch.cumsum(seqlens_k2, dim=0, dtype=torch.int32))
+                    sparse_cu_seqlens_k_cpu = F.pad(torch.cumsum(sparse_cache_seqlens_int32_cpu, dim=0, dtype=torch.int32), (1, 0))
+                    
+                    cache_seqlens_int32_cpu = metadata.cache_seqlens_int32.to(device="cpu")
+                    
+                    seqlens_k1_cpu = (cache_seqlens_int32_cpu - self.k1_kernel_size) // self.k1_kernel_stride + 1
+                    seqlens_k2_cpu = (cache_seqlens_int32_cpu - self.k2_kernel_size) // self.k2_kernel_stride + 1
+                    cu_seqlens_k1_cpu = F.pad(torch.cumsum(seqlens_k1_cpu, dim=0, dtype=torch.int32), (1, 0))
+                    cu_seqlens_k2_cpu = F.pad(torch.cumsum(seqlens_k2_cpu, dim=0, dtype=torch.int32), (1, 0))
                     
                     # copy k1_loc & k2_loc
                     
                     # compress k1 & k2
-                    token_nums = metadata.cu_seqlens_k[1:] - metadata.cu_seqlens_k[:-1]
-                    input_lens = metadata.cu_seqlens_q[1:] - metadata.cu_seqlens_q[:-1]
-                    history_lens = token_nums - input_lens
                     
-                    metadata.history_compress_k1_token_nums.copy_(torch.maximum((history_lens - self.k1_kernel_size) // self.k1_kernel_stride + 1, torch.zeros(1,device=history_lens.device,dtype=torch.int32)))
-                    metadata.history_compress_k2_token_nums.copy_(torch.maximum((history_lens - self.k2_kernel_size) // self.k2_kernel_stride + 1, torch.zeros(1,device=history_lens.device,dtype=torch.int32)))
+                    token_nums_cpu = (cu_seqlens_k_cpu[1:] - cu_seqlens_k_cpu[:-1])
+                    input_lens_cpu = (cu_seqlens_q_cpu[1:] - cu_seqlens_q_cpu[:-1])
+                    
+                    history_lens_cpu = token_nums_cpu - input_lens_cpu
+                    
+                    history_compress_k1_token_nums_cpu = torch.maximum((history_lens_cpu - self.k1_kernel_size) // self.k1_kernel_stride + 1, torch.zeros(1,device=history_lens_cpu.device,dtype=torch.int32))
+                    history_compress_k2_token_nums_cpu = torch.maximum((history_lens_cpu - self.k2_kernel_size) // self.k2_kernel_stride + 1, torch.zeros(1,device=history_lens_cpu.device,dtype=torch.int32))
+                    
+                    new_k1_token_nums_cpu = token_nums_cpu - history_compress_k1_token_nums_cpu * self.k1_kernel_stride
+                    new_k2_token_nums_cpu = token_nums_cpu - history_compress_k2_token_nums_cpu * self.k2_kernel_stride
+                    cu_new_k1_token_nums_cpu = F.pad(torch.cumsum(new_k1_token_nums_cpu, dim=0, dtype=torch.int32), (1, 0))
+                    cu_new_k2_token_nums_cpu = F.pad(torch.cumsum(new_k2_token_nums_cpu, dim=0, dtype=torch.int32), (1, 0))
+                    
+                    new_compress_k1_token_nums_cpu = torch.maximum((new_k1_token_nums_cpu - self.k1_kernel_size) // self.k1_kernel_stride + 1, torch.zeros(1,device=new_k1_token_nums_cpu.device,dtype=torch.int32))
+                    new_compress_k2_token_nums_cpu = torch.maximum((new_k2_token_nums_cpu - self.k2_kernel_size) // self.k2_kernel_stride + 1, torch.zeros(1,device=new_k2_token_nums_cpu.device,dtype=torch.int32))
+                    cu_new_compress_k1_token_nums_cpu = F.pad(torch.cumsum(new_compress_k1_token_nums_cpu, dim=0, dtype=torch.int32), (1, 0))
+                    cu_new_compress_k2_token_nums_cpu = F.pad(torch.cumsum(new_compress_k2_token_nums_cpu, dim=0, dtype=torch.int32), (1, 0))
+                    
+                    total_compress_k1_token_nums_cpu = history_compress_k1_token_nums_cpu + new_compress_k1_token_nums_cpu
+                    total_compress_k2_token_nums_cpu = history_compress_k2_token_nums_cpu + new_compress_k2_token_nums_cpu
+                    cu_total_compress_k1_token_nums_cpu = F.pad(torch.cumsum(total_compress_k1_token_nums_cpu, dim=0, dtype=torch.int32), (1, 0))
+                    cu_total_compress_k2_token_nums_cpu = F.pad(torch.cumsum(total_compress_k2_token_nums_cpu, dim=0, dtype=torch.int32), (1, 0))
+                    
+                    # torch.cuda.synchronize()
+                    # end = time.perf_counter()
+                    # print("cpu usage : {} ms".format((end - start) * 1000))
+                    
+                    # torch.cuda.synchronize()
+                    # start = time.perf_counter()
+                
+
+                    metadata.sparse_cache_seqlens_int32.copy_(sparse_cache_seqlens_int32_cpu)
+                    metadata.sparse_cu_seqlens_k.copy_(sparse_cu_seqlens_k_cpu)
+                    
+                    metadata.cu_seqlens_k1.copy_(cu_seqlens_k1_cpu)
+                    metadata.cu_seqlens_k2.copy_(cu_seqlens_k2_cpu)
 
                     
-                    metadata.new_k1_token_nums.copy_(token_nums - metadata.history_compress_k1_token_nums * self.k1_kernel_stride)
-                    metadata.new_k2_token_nums.copy_(token_nums - metadata.history_compress_k2_token_nums * self.k2_kernel_stride)
-                    
-                    
-                    metadata.cu_new_k1_token_nums.copy_(F.pad(torch.cumsum(metadata.new_k1_token_nums, dim=0, dtype=torch.int32), (1, 0)))
-                    metadata.cu_new_k2_token_nums.copy_(F.pad(torch.cumsum(metadata.new_k2_token_nums, dim=0, dtype=torch.int32), (1, 0)))
-                    
-                    metadata.new_compress_k1_token_nums.copy_(torch.maximum((metadata.new_k1_token_nums - self.k1_kernel_size) // self.k1_kernel_stride + 1, torch.zeros(1,device=metadata.new_k1_token_nums.device,dtype=torch.int32)))
-                    metadata.new_compress_k2_token_nums.copy_(torch.maximum((metadata.new_k2_token_nums - self.k2_kernel_size) // self.k2_kernel_stride + 1, torch.zeros(1,device=metadata.new_k2_token_nums.device,dtype=torch.int32)))
-                    
-                    
-                    metadata.cu_new_compress_k1_token_nums.copy_(F.pad(torch.cumsum(metadata.new_compress_k1_token_nums, dim=0, dtype=torch.int32), (1, 0)))
-                    metadata.cu_new_compress_k2_token_nums.copy_(F.pad(torch.cumsum(metadata.new_compress_k2_token_nums, dim=0, dtype=torch.int32), (1, 0)))
-                    
-                    metadata.total_compress_k1_token_nums.copy_(metadata.history_compress_k1_token_nums + metadata.new_compress_k1_token_nums)
-                    metadata.total_compress_k2_token_nums.copy_(metadata.history_compress_k2_token_nums + metadata.new_compress_k2_token_nums)
-                    
-                    metadata.cu_total_compress_k1_token_nums.copy_(F.pad(torch.cumsum(metadata.total_compress_k1_token_nums, dim=0, dtype=torch.int32), (1, 0)))
-                    metadata.cu_total_compress_k2_token_nums.copy_(F.pad(torch.cumsum(metadata.total_compress_k2_token_nums, dim=0, dtype=torch.int32), (1, 0)))
+                    metadata.history_compress_k1_token_nums.copy_(history_compress_k1_token_nums_cpu)
+                    metadata.history_compress_k2_token_nums.copy_(history_compress_k2_token_nums_cpu)
 
+                    metadata.new_k1_token_nums.copy_(new_k1_token_nums_cpu)
+                    metadata.new_k2_token_nums.copy_(new_k2_token_nums_cpu)
+                    metadata.cu_new_k1_token_nums.copy_(cu_new_k1_token_nums_cpu)
+                    metadata.cu_new_k2_token_nums.copy_(cu_new_k2_token_nums_cpu)
+                    
+                    metadata.new_compress_k1_token_nums.copy_(new_compress_k1_token_nums_cpu)
+                    metadata.new_compress_k2_token_nums.copy_(new_compress_k2_token_nums_cpu)
+                    metadata.cu_new_compress_k1_token_nums.copy_(cu_new_compress_k1_token_nums_cpu)
+                    metadata.cu_new_compress_k2_token_nums.copy_(cu_new_compress_k2_token_nums_cpu)
+                    
+                    
+                    metadata.total_compress_k1_token_nums.copy_(total_compress_k1_token_nums_cpu)
+                    metadata.total_compress_k2_token_nums.copy_(total_compress_k2_token_nums_cpu)
+                    metadata.cu_total_compress_k1_token_nums.copy_(cu_total_compress_k1_token_nums_cpu)
+                    metadata.cu_total_compress_k2_token_nums.copy_(cu_total_compress_k2_token_nums_cpu)
+                    
                     metadata.k1_table.copy_(self.req_to_sparse_k1_token[req_pool_indices])
                     metadata.k2_table.copy_(self.req_to_sparse_k2_token[req_pool_indices])
+                    
+                    # torch.cuda.synchronize()
+                    # end = time.perf_counter()
+                    # print("mv cpu to gpu usage : {} ms".format((end - start) * 1000))
+                    
+                    
+                    # metadata.history_compress_k1_token_nums.copy_(torch.maximum((history_lens - self.k1_kernel_size) // self.k1_kernel_stride + 1, torch.zeros(1,device=history_lens.device,dtype=torch.int32)))
+                    # metadata.history_compress_k2_token_nums.copy_(torch.maximum((history_lens - self.k2_kernel_size) // self.k2_kernel_stride + 1, torch.zeros(1,device=history_lens.device,dtype=torch.int32)))
+
+                    
+                    # metadata.new_k1_token_nums.copy_(token_nums - metadata.history_compress_k1_token_nums * self.k1_kernel_stride)
+                    # metadata.new_k2_token_nums.copy_(token_nums - metadata.history_compress_k2_token_nums * self.k2_kernel_stride)
+                    
+                    
+                    # metadata.cu_new_k1_token_nums.copy_(F.pad(torch.cumsum(metadata.new_k1_token_nums, dim=0, dtype=torch.int32), (1, 0)))
+                    # metadata.cu_new_k2_token_nums.copy_(F.pad(torch.cumsum(metadata.new_k2_token_nums, dim=0, dtype=torch.int32), (1, 0)))
+                    
+                    # metadata.new_compress_k1_token_nums.copy_(torch.maximum((metadata.new_k1_token_nums - self.k1_kernel_size) // self.k1_kernel_stride + 1, torch.zeros(1,device=metadata.new_k1_token_nums.device,dtype=torch.int32)))
+                    # metadata.new_compress_k2_token_nums.copy_(torch.maximum((metadata.new_k2_token_nums - self.k2_kernel_size) // self.k2_kernel_stride + 1, torch.zeros(1,device=metadata.new_k2_token_nums.device,dtype=torch.int32)))
+                    
+                    
+                    # metadata.cu_new_compress_k1_token_nums.copy_(F.pad(torch.cumsum(metadata.new_compress_k1_token_nums, dim=0, dtype=torch.int32), (1, 0)))
+                    # metadata.cu_new_compress_k2_token_nums.copy_(F.pad(torch.cumsum(metadata.new_compress_k2_token_nums, dim=0, dtype=torch.int32), (1, 0)))
+                    
+                    # metadata.total_compress_k1_token_nums.copy_(metadata.history_compress_k1_token_nums + metadata.new_compress_k1_token_nums)
+                    # metadata.total_compress_k2_token_nums.copy_(metadata.history_compress_k2_token_nums + metadata.new_compress_k2_token_nums)
+                    
+                    # metadata.cu_total_compress_k1_token_nums.copy_(F.pad(torch.cumsum(metadata.total_compress_k1_token_nums, dim=0, dtype=torch.int32), (1, 0)))
+                    # metadata.cu_total_compress_k2_token_nums.copy_(F.pad(torch.cumsum(metadata.total_compress_k2_token_nums, dim=0, dtype=torch.int32), (1, 0)))
+
+
+                    
+                    
+                    # if seq_lens[0] == 8193:
+                    #     torch.cuda.synchronize()
+                    #     end = time.perf_counter()
+                    #     torch.cuda.cudart().cudaProfilerStop()
+                    #     execution_time_ms = (end - start) * 1000
+                    #     print(f"usage : {execution_time_ms:.2f} ms")
+                        
+                    # do on cpu
+                    
+                    
                 
                 self._maybe_update_local_attn_metadata_for_replay(
                     metadata,
