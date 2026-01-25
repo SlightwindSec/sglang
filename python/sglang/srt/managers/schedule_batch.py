@@ -4,6 +4,7 @@ import enum
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+import torch.nn.functional as F
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -1297,6 +1298,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
+    
+    # sparse
+    sparse_cache_seqlens_int32_cpu: Optional[torch.Tensor] = None
+    sparse_cu_seqlens_k_cpu: Optional[torch.Tensor] = None
+    cu_seqlens_k1_cpu: Optional[torch.Tensor] = None
+    cu_seqlens_k2_cpu: Optional[torch.Tensor] = None
+    
+    history_compress_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    new_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_new_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    new_compress_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_new_compress_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    total_compress_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_total_compress_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    history_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    new_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_new_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    new_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_new_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    total_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_total_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
 
     @classmethod
     def init_new(
@@ -2002,6 +2031,71 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 device=self.device,
             )
 
+        is_sparse_minicpm = self.model_config.minicpm_sparse_config is not None
+        
+        if is_sparse_minicpm:
+            # sparse minicpm
+            minicpm_sparse_config = self.model_config.minicpm_sparse_config
+            
+            topk = minicpm_sparse_config.topk
+            block_size = minicpm_sparse_config.block_size
+            window_size = minicpm_sparse_config.window_size
+            sparse_topk = topk + (window_size // block_size)
+            num_sparse_topk_tokens = block_size * sparse_topk
+            
+            k1_kernel_size = minicpm_sparse_config.kernel_size
+            k1_kernel_stride = minicpm_sparse_config.kernel_stride
+            k2_kernel_size = k1_kernel_size * 4
+            k2_kernel_stride = k1_kernel_stride * 4
+            
+            mod_block_size_cpu = self.seq_lens.to(device="cpu") % minicpm_sparse_config.block_size
+            cu_seqlens_k_cpu = F.pad(torch.cumsum(self.seq_lens_cpu, dim=0, dtype=torch.int32), (1, 0))
+            cu_seqlens_q_cpu = torch.arange(0, bs + 1, dtype=torch.int32).to(device="cpu")
+            
+            sparse_cache_seqlens_cpu = torch.where(
+                mod_block_size_cpu == 0,
+                num_sparse_topk_tokens,
+                (sparse_topk - 1) * block_size + mod_block_size_cpu
+            )
+            
+            self.sparse_cache_seqlens_int32_cpu = torch.repeat_interleave(sparse_cache_seqlens_cpu, 2)
+            
+            self.sparse_cu_seqlens_k_cpu = F.pad(torch.cumsum(self.sparse_cache_seqlens_int32_cpu, dim=0, dtype=torch.int32), (1, 0))
+            
+            self.cache_seqlens_int32_cpu = self.seq_lens.to(dtype=torch.int32, device="cpu")
+            
+            self.seqlens_k1_cpu = (self.cache_seqlens_int32_cpu - k1_kernel_size) // k1_kernel_stride + 1
+            self.seqlens_k2_cpu = (self.cache_seqlens_int32_cpu - k2_kernel_size) // k2_kernel_stride + 1
+            self.cu_seqlens_k1_cpu = F.pad(torch.cumsum(self.seqlens_k1_cpu, dim=0, dtype=torch.int32), (1, 0))
+            self.cu_seqlens_k2_cpu = F.pad(torch.cumsum(self.seqlens_k2_cpu, dim=0, dtype=torch.int32), (1, 0))
+            
+            # copy k1_loc & k2_loc
+            
+            # compress k1 & k2
+            
+            self.token_nums_cpu = (cu_seqlens_k_cpu[1:] - cu_seqlens_k_cpu[:-1])
+            self.input_lens_cpu = (cu_seqlens_q_cpu[1:] - cu_seqlens_q_cpu[:-1])
+            
+            self.history_lens_cpu = self.token_nums_cpu - self.input_lens_cpu
+            
+            self.history_compress_k1_token_nums_cpu = torch.maximum((self.history_lens_cpu - k1_kernel_size) // k1_kernel_stride + 1, torch.zeros(1,device=self.history_lens_cpu.device,dtype=torch.int32))
+            self.history_compress_k2_token_nums_cpu = torch.maximum((self.history_lens_cpu - k2_kernel_size) // k2_kernel_stride + 1, torch.zeros(1,device=self.history_lens_cpu.device,dtype=torch.int32))
+            
+            self.new_k1_token_nums_cpu = self.token_nums_cpu - self.history_compress_k1_token_nums_cpu * k1_kernel_stride
+            self.new_k2_token_nums_cpu = self.token_nums_cpu - self.history_compress_k2_token_nums_cpu * k2_kernel_stride
+            self.cu_new_k1_token_nums_cpu = F.pad(torch.cumsum(self.new_k1_token_nums_cpu, dim=0, dtype=torch.int32), (1, 0))
+            self.cu_new_k2_token_nums_cpu = F.pad(torch.cumsum(self.new_k2_token_nums_cpu, dim=0, dtype=torch.int32), (1, 0))
+            
+            self.new_compress_k1_token_nums_cpu = torch.maximum((self.new_k1_token_nums_cpu - k1_kernel_size) // k1_kernel_stride + 1, torch.zeros(1,device=self.new_k1_token_nums_cpu.device,dtype=torch.int32))
+            self.new_compress_k2_token_nums_cpu = torch.maximum((self.new_k2_token_nums_cpu - k2_kernel_size) // k2_kernel_stride + 1, torch.zeros(1,device=self.new_k2_token_nums_cpu.device,dtype=torch.int32))
+            self.cu_new_compress_k1_token_nums_cpu = F.pad(torch.cumsum(self.new_compress_k1_token_nums_cpu, dim=0, dtype=torch.int32), (1, 0))
+            self.cu_new_compress_k2_token_nums_cpu = F.pad(torch.cumsum(self.new_compress_k2_token_nums_cpu, dim=0, dtype=torch.int32), (1, 0))
+            
+            self.total_compress_k1_token_nums_cpu = self.history_compress_k1_token_nums_cpu + self.new_compress_k1_token_nums_cpu
+            self.total_compress_k2_token_nums_cpu = self.history_compress_k2_token_nums_cpu + self.new_compress_k2_token_nums_cpu
+            self.cu_total_compress_k1_token_nums_cpu = F.pad(torch.cumsum(self.total_compress_k1_token_nums_cpu, dim=0, dtype=torch.int32), (1, 0))
+            self.cu_total_compress_k2_token_nums_cpu = F.pad(torch.cumsum(self.total_compress_k2_token_nums_cpu, dim=0, dtype=torch.int32), (1, 0))
+
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
@@ -2214,6 +2308,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            sparse_cache_seqlens_int32_cpu=self.sparse_cache_seqlens_int32_cpu,
+            sparse_cu_seqlens_k_cpu=self.sparse_cu_seqlens_k_cpu,
+            cu_seqlens_k1_cpu=self.cu_seqlens_k1_cpu,
+            cu_seqlens_k2_cpu=self.cu_seqlens_k2_cpu,
+            history_compress_k1_token_nums_cpu=self.history_compress_k1_token_nums_cpu,
+            new_k1_token_nums_cpu=self.new_k1_token_nums_cpu,
+            cu_new_k1_token_nums_cpu=self.cu_new_k1_token_nums_cpu,
+            new_compress_k1_token_nums_cpu=self.new_compress_k1_token_nums_cpu,
+            cu_new_compress_k1_token_nums_cpu=self.cu_new_compress_k1_token_nums_cpu,
+            total_compress_k1_token_nums_cpu=self.total_compress_k1_token_nums_cpu,
+            cu_total_compress_k1_token_nums_cpu=self.cu_total_compress_k1_token_nums_cpu,
+            history_compress_k2_token_nums_cpu=self.history_compress_k2_token_nums_cpu,
+            new_k2_token_nums_cpu=self.new_k2_token_nums_cpu,
+            cu_new_k2_token_nums_cpu=self.cu_new_k2_token_nums_cpu,
+            new_compress_k2_token_nums_cpu=self.new_compress_k2_token_nums_cpu,
+            cu_new_compress_k2_token_nums_cpu=self.cu_new_compress_k2_token_nums_cpu,
+            total_compress_k2_token_nums_cpu=self.total_compress_k2_token_nums_cpu,
+            cu_total_compress_k2_token_nums_cpu=self.cu_total_compress_k2_token_nums_cpu,
+            
         )
 
     def copy(self):
@@ -2355,3 +2468,32 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+    
+    
+    # sparse
+    sparse_cache_seqlens_int32_cpu: Optional[torch.Tensor] = None
+    sparse_cu_seqlens_k_cpu: Optional[torch.Tensor] = None
+    cu_seqlens_k1_cpu: Optional[torch.Tensor] = None
+    cu_seqlens_k2_cpu: Optional[torch.Tensor] = None
+    
+    history_compress_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    new_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_new_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    new_compress_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_new_compress_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    total_compress_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_total_compress_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    history_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    new_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_new_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    new_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_new_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    total_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_total_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None

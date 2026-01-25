@@ -418,6 +418,34 @@ class ForwardBatch:
 
     # decode, only used in decode
     # sparse_cache_seqlens_cpu: Optional[torch.Tensor] = None
+    
+    # sparse
+    sparse_cache_seqlens_int32_cpu: Optional[torch.Tensor] = None
+    sparse_cu_seqlens_k_cpu: Optional[torch.Tensor] = None
+    cu_seqlens_k1_cpu: Optional[torch.Tensor] = None
+    cu_seqlens_k2_cpu: Optional[torch.Tensor] = None
+    
+    history_compress_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    new_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_new_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    new_compress_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_new_compress_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    total_compress_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_total_compress_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    history_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    new_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_new_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    new_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_new_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    total_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_total_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
 
     @classmethod
     def init_new(
@@ -467,6 +495,24 @@ class ForwardBatch:
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
+            sparse_cache_seqlens_int32_cpu=batch.sparse_cache_seqlens_int32_cpu,
+            sparse_cu_seqlens_k_cpu=batch.sparse_cu_seqlens_k_cpu,
+            cu_seqlens_k1_cpu=batch.cu_seqlens_k1_cpu,
+            cu_seqlens_k2_cpu=batch.cu_seqlens_k2_cpu,
+            history_compress_k1_token_nums_cpu=batch.history_compress_k1_token_nums_cpu,
+            new_k1_token_nums_cpu=batch.new_k1_token_nums_cpu,
+            cu_new_k1_token_nums_cpu=batch.cu_new_k1_token_nums_cpu,
+            new_compress_k1_token_nums_cpu=batch.new_compress_k1_token_nums_cpu,
+            cu_new_compress_k1_token_nums_cpu=batch.cu_new_compress_k1_token_nums_cpu,
+            total_compress_k1_token_nums_cpu=batch.total_compress_k1_token_nums_cpu,
+            cu_total_compress_k1_token_nums_cpu=batch.cu_total_compress_k1_token_nums_cpu,
+            history_compress_k2_token_nums_cpu=batch.history_compress_k2_token_nums_cpu,
+            new_k2_token_nums_cpu=batch.new_k2_token_nums_cpu,
+            cu_new_k2_token_nums_cpu=batch.cu_new_k2_token_nums_cpu,
+            new_compress_k2_token_nums_cpu=batch.new_compress_k2_token_nums_cpu,
+            cu_new_compress_k2_token_nums_cpu=batch.cu_new_compress_k2_token_nums_cpu,
+            total_compress_k2_token_nums_cpu=batch.total_compress_k2_token_nums_cpu,
+            cu_total_compress_k2_token_nums_cpu=batch.cu_total_compress_k2_token_nums_cpu,
         )
         device = model_runner.device
 
