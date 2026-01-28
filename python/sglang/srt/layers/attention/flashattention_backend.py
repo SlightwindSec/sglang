@@ -591,14 +591,14 @@ class FlashAttentionBackend(AttentionBackend):
 
             # self.block_score_buffer = torch.zeros((self.head_group_num, self.max_context_len, self.max_context_len // self.block_size), dtype=torch.bfloat16, device="cuda")
 
-            self.dump = False
-            
-            if not self.dump:
-                self.mock_topks = torch.from_numpy(np.fromfile("/tmp/sglang_flashattention_decode_topk_idxs.bin", dtype=np.int32).reshape(32,2,1,96)).to(device="cuda")
-                self.mock_sparse_page_table = torch.from_numpy(np.fromfile("/tmp/sglang_flashattention_decode_sparse_page_table.bin", dtype=np.int32).reshape(32, 2, 6144)).to(device="cuda")
-            else:
-                self.mock_topks = torch.zeros((32, 2, 1, 96), dtype=torch.int32, device="cuda")
-                self.mock_sparse_page_table = torch.zeros((32, 2, 6144), dtype=torch.int32, device="cuda")
+            # self.dump = False
+            # 
+            # if not self.dump:
+            #     self.mock_topks = torch.from_numpy(np.fromfile("/tmp/sglang_flashattention_decode_topk_idxs.bin", dtype=np.int32).reshape(32,2,1,96)).to(device="cuda")
+            #     self.mock_sparse_page_table = torch.from_numpy(np.fromfile("/tmp/sglang_flashattention_decode_sparse_page_table.bin", dtype=np.int32).reshape(32, 2, 6144)).to(device="cuda")
+            # else:
+            #     self.mock_topks = torch.zeros((32, 2, 1, 96), dtype=torch.int32, device="cuda")
+            #     self.mock_sparse_page_table = torch.zeros((32, 2, 6144), dtype=torch.int32, device="cuda")
 
     def update_batch_for_sparse(self, forward_batch: ForwardBatch, metadata: FlashAttentionMetadata):
         bs = forward_batch.batch_size
