@@ -445,6 +445,7 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         self.forward_metadata = self._replay_metadata(
             bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
@@ -1180,6 +1181,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         metadata = self._replay_metadata(
             bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
@@ -1276,6 +1278,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_replay_cuda_graph(
@@ -1287,6 +1290,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 forward_mode,
                 spec_info,
                 seq_lens_cpu,
+                forward_batch=forward_batch,
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -1541,6 +1545,7 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         metadata = self._replay_metadata(bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu)
         self.forward_metadata = metadata
@@ -1554,13 +1559,18 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         layer_id: int,
         output_attentions: bool = False,
     ) -> torch.Tensor:
-        batch_size, seq_len, num_heads, head_dim = q.shape
-        dtype = q.dtype
+
+        num_heads = q.shape[2]
+        head_dim = q.shape[3]
+        if forward_batch.forward_mode.is_decode():
+            seq_len = 1
+        else:
+            seq_len = torch.max(forward_batch.extend_seq_lens)
 
         mamba_indices = self._get_mamba_indices(forward_batch)
-
         initial_state = None
-        if forward_batch.forward_mode.is_decode():
+        has_initial_state = forward_batch.forward_mode.is_decode() or forward_batch.extend_prefix_lens > 0
+        if has_initial_state:
             cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
             if cache_idx is not None:
                 layer_cache = self.req_to_token_pool.mamba_pool.mamba2_layer_cache(cache_idx)
@@ -1576,26 +1586,8 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
 
         g_gamma = self.g_gamma
 
-        # Compute cu_seqlens for all modes (CUDA graph compatible)
-        # Use extend_seq_lens if available, otherwise use seq_lens (decode mode)
-        import torch.nn.functional as F
-        if forward_batch.extend_seq_lens is not None:
-            # Prefill/extend mode: actual sequence lengths
-            seq_lens_for_cu = forward_batch.extend_seq_lens
-        else:
-            # Decode mode: each request generates 1 token, so use seq_lens
-            # seq_lens represents total sequence length, but we need extend (1 token per request)
-            # So we create a tensor of 1s with shape (batch_size,)
-            seq_lens_for_cu = torch.ones(
-                forward_batch.batch_size,
-                dtype=torch.int32,
-                device=q.device
-            )
-
-        # Compute cu_seqlens: [0, seq1, seq1+seq2, ...]
-        cu_seqlens = F.pad(seq_lens_for_cu.cumsum(dim=0), (1, 0))
-
-        if seq_len < 64:
+        mode = "fused_recurrent" if seq_len < 64 else "chunk"
+        if forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
             o, final_state = fused_recurrent_simple_gla(
                 q=q,
                 k=k,
@@ -1604,7 +1596,7 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
                 scale=scale,
                 initial_state=initial_state,
                 output_final_state=True,
-                cu_seqlens=cu_seqlens,
+                cu_seqlens=self.forward_metadata.query_start_loc,
             )
         else:
             o, final_state = chunk_simple_gla(
@@ -1615,8 +1607,7 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
                 initial_state=initial_state,
                 output_final_state=True,
                 scale=scale,
-                head_first=False,
-                cu_seqlens=cu_seqlens,
+                cu_seqlens=self.forward_metadata.query_start_loc,
             )
 
         if final_state is not None:
