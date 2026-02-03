@@ -576,8 +576,8 @@ class FlashAttentionBackend(AttentionBackend):
             self.sparse_topk = topk + (self.window_size // self.block_size)
             self.num_sparse_topk_tokens = self.block_size * self.sparse_topk
 
-            self.compress_k1 = CompressK(self.num_kv_heads, model_runner.model_config.hidden_size // model_runner.model_config.num_attention_heads, kernel_size=self.kernel_size, kernel_stride=self.kernel_stride)
-            self.compress_k2 = CompressK(self.num_kv_heads, model_runner.model_config.hidden_size // model_runner.model_config.num_attention_heads, kernel_size=self.kernel_size*4, kernel_stride=self.kernel_stride*4)
+            self.compress_k1 = CompressK(self.num_kv_heads, model_runner.model_config.hidden_size // model_runner.model_config.num_attention_heads, kernel_size=self.kernel_size, kernel_stride=self.kernel_stride, max_context_len=self.max_context_len)
+            self.compress_k2 = CompressK(self.num_kv_heads, model_runner.model_config.hidden_size // model_runner.model_config.num_attention_heads, kernel_size=self.kernel_size*4, kernel_stride=self.kernel_stride*4, max_context_len=self.max_context_len)
      
             # TODO: sync with sparse config 
             self.head_group_num = 2 # k_head_num
@@ -1211,6 +1211,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata=metadata,
                     full_compressed_k1=self.decode_cuda_graph_metadata["compress_k1"], # output
                     full_compressed_k2=self.decode_cuda_graph_metadata["compress_k2"], # output
+                    max_context_length=self.max_context_len,
                 )
             else:
                 compressed_k = torch.zeros(
@@ -1230,6 +1231,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata=metadata,
                     full_compressed_k1=compressed_k, # output
                     full_compressed_k2=compressed_k2, # output
+                    max_context_length=self.max_context_len,
                 )
 
             # query_states = query_states.reshape(-1, query_states.shape[2], query_states.shape[3])

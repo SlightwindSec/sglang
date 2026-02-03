@@ -164,7 +164,7 @@ def pad_input(hidden_states, indices, batch, seqlen):
     return rearrange(output, "(b s) ... -> b s ...", b=batch)
 
 class CompressK(torch.nn.Module):
-    def __init__(self, head_num_k, head_dim, kernel_size, kernel_stride=16):
+    def __init__(self, head_num_k, head_dim, kernel_size, kernel_stride=16, max_context_len=32768):
         """
         Module for compressing key (K) representations.
         Args:
@@ -172,12 +172,14 @@ class CompressK(torch.nn.Module):
             head_dim (int): Dimension of each attention head.
             kernel_size (int): Size of each chunk used for compression.
             kernel_stride (int, optional): Stride used when dividing input into chunks. Default is 16.
+            max_context_len (int, optional): Maximum context length for the model. Default is 32768.
         """
         super().__init__()
         self.kernel_size = kernel_size
         self.head_num_k = head_num_k
         self.head_dim = head_dim
         self.kernel_stride = kernel_stride
+        self.max_context_length = max_context_len
 
     def forward(self, k: torch.Tensor, cu_seqlens):
         compressed_k_triton, cu_seqlens_compressed_trition = self.forward_triton(k, cu_seqlens)
@@ -222,14 +224,13 @@ class CompressK(torch.nn.Module):
         # Derive parameters for explicit passing to self-contained kernel
         # TODO these two params should be passed in by arguments
         actual_batch_size = 1
-        max_context_length = 20480  # Model's maximum context length for conservative allocation
         
         # ==============================================================================
         # BUFFER ALLOCATION
         # ==============================================================================
         
         # Use provided explicit parameters for buffer allocation
-        max_chunks_per_seq = max(0, (max_context_length - self.kernel_size) // self.kernel_stride + 1)
+        max_chunks_per_seq = max(0, (self.max_context_length - self.kernel_size) // self.kernel_stride + 1)
         max_total_chunks = actual_batch_size * max_chunks_per_seq
         
         # Allocate maximum possible output buffers
@@ -620,9 +621,9 @@ def get_compress_k_v2(layer,
                     forward_batch,
                     metadata: "FlashAttentionMetadata",
                     full_compressed_k1,
-                    full_compressed_k2):
+                    full_compressed_k2,
+                    max_context_length):
     batch = len(forward_batch.req_pool_indices)
-    max_context_length = 20480
 
     # k1 stride is 16, window is 32
     # k2 stride is 64, windiw is 128
