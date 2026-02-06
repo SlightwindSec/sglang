@@ -55,6 +55,7 @@ def fused_attn_pooling_online_topk_prefill(
     
     Fixed: is_causal=True
     Static: max_seqlen_q_grid (bucketed for grid), actual_max_seqlen_q/k (exact for causal mask)
+
     Runtime: cache_lens tensor for per-batch cache length (supports chunk prefill)
     
     Chunk prefill support:

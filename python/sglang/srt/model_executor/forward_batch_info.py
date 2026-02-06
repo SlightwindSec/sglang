@@ -447,8 +447,9 @@ class ForwardBatch:
     total_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
     cu_total_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
 
+    # Stage1 optimization metadata
     cache_seqlens_int32_stage1_cpu: Optional[torch.Tensor] = None
-    
+
     @classmethod
     def init_new(
         cls,

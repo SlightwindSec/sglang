@@ -5,37 +5,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.configs.mamba_utils import SimpleGLACacheParams, SimpleGLAStateShape
 
-@dataclass
-class MiniCPMSparseConfig:
-    block_size: int
-    dense_len: int
-    init_blocks: int
-    kernel_size: int
-    kernel_stride: int
-    topk: int
-    window_size: int
-    use_nope: bool
-
-    @classmethod
-    def from_hf_config(cls, hf_config) -> Optional["MiniCPMSparseConfig"]:
-        """
-        get MiniCPMSparseConfig from HuggingFace model config
-        """
-        sparse_dict = getattr(hf_config, "sparse_config", None)
-        if sparse_dict is None:
-            return None
-
-        return cls(
-            block_size=sparse_dict["block_size"],
-            dense_len=sparse_dict["dense_len"],
-            init_blocks=sparse_dict["init_blocks"],
-            kernel_size=sparse_dict["kernel_size"],
-            kernel_stride=sparse_dict["kernel_stride"],
-            topk=sparse_dict["topk"],
-            window_size=sparse_dict["window_size"],
-            use_nope=sparse_dict.get("use_nope"),
-        )
-
 
 class MiniCPMHybridConfig(PretrainedConfig):
     """
@@ -73,6 +42,15 @@ class MiniCPMHybridConfig(PretrainedConfig):
         lightning_nh=16,
         lightning_nkv=16,
         lightning_head_dim=64,
+        # Sparse attention config fields
+        sparse_block_size=32,
+        sparse_dense_len=512,
+        sparse_init_blocks=1,
+        sparse_kernel_size=32,
+        sparse_kernel_stride=16,
+        sparse_topk=8,
+        sparse_window_size=64,
+        sparse_use_nope=False,
         **kwargs,
     ):
         super().__init__(
@@ -100,6 +78,26 @@ class MiniCPMHybridConfig(PretrainedConfig):
         self.lightning_nh = lightning_nh
         self.lightning_nkv = lightning_nkv
         self.lightning_head_dim = lightning_head_dim
+        # Sparse attention config fields
+        self.sparse_block_size = sparse_block_size
+        self.sparse_dense_len = sparse_dense_len
+        self.sparse_init_blocks = sparse_init_blocks
+        self.sparse_kernel_size = sparse_kernel_size
+        self.sparse_kernel_stride = sparse_kernel_stride
+        self.sparse_topk = sparse_topk
+        self.sparse_window_size = sparse_window_size
+        self.sparse_use_nope = sparse_use_nope
+        # Load sparse_config from original config if available (for backward compatibility)
+        sparse_config = kwargs.pop("sparse_config", None)
+        if sparse_config is not None:
+            self.sparse_block_size = sparse_config.get("block_size", self.sparse_block_size)
+            self.sparse_dense_len = sparse_config.get("dense_len", self.sparse_dense_len)
+            self.sparse_init_blocks = sparse_config.get("init_blocks", self.sparse_init_blocks)
+            self.sparse_kernel_size = sparse_config.get("kernel_size", self.sparse_kernel_size)
+            self.sparse_kernel_stride = sparse_config.get("kernel_stride", self.sparse_kernel_stride)
+            self.sparse_topk = sparse_config.get("topk", self.sparse_topk)
+            self.sparse_window_size = sparse_config.get("window_size", self.sparse_window_size)
+            self.sparse_use_nope = sparse_config.get("use_nope", self.sparse_use_nope)
 
     @property
     def mamba2_cache_params(self):
@@ -135,3 +133,23 @@ class MiniCPMHybridConfig(PretrainedConfig):
                 i for i, mixer_type in enumerate(self.mixer_types)
                 if mixer_type in ["minicpm4", "minicpm", "standard", "attention", "attn"]
             ]
+
+    @property
+    def has_sparse_attention(self) -> bool:
+        """Check if this config has sparse attention layers (minicpm4 mixer type)."""
+        return any(mt == "minicpm4" for mt in self.mixer_types)
+
+    @property
+    def has_lightning_layers(self) -> bool:
+        """Check if this config has lightning attention layers."""
+        return any(mt in ["lightning", "lightning_attn", "lightning-attn"] for mt in self.mixer_types)
+
+    @property
+    def sparse_layer_ids(self) -> list:
+        """Get the indices of layers with sparse attention."""
+        return [i for i, mt in enumerate(self.mixer_types) if mt == "minicpm4"]
+
+    @property
+    def lightning_layer_ids(self) -> list:
+        """Get the indices of layers with lightning attention."""
+        return [i for i, mt in enumerate(self.mixer_types) if mt in ["lightning", "lightning_attn", "lightning-attn"]]

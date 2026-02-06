@@ -177,6 +177,26 @@ def create_dual_chunk_flash_attn_backend(runner):
     return DualChunkFlashAttentionBackend(runner)
 
 
+@register_attention_backend("minicpm_flashattn")
+def create_minicpm_flashattn_backend(runner):
+    """Create MiniCPM Sparse Attention backend with flash_attn kernel."""
+    from sglang.srt.layers.attention.minicpm_backend import MiniCPMSparseBackend
+
+    return MiniCPMSparseBackend(
+        runner,
+    )
+
+
+@register_attention_backend("minicpm_flashinfer")
+def create_minicpm_flashinfer_backend(runner):
+    """Create MiniCPM Sparse Attention backend with flashinfer kernel."""
+    from sglang.srt.layers.attention.minicpm_backend import MiniCPMSparseBackend
+
+    return MiniCPMSparseBackend(
+        runner,
+    )
+
+
 def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBackend"):
     """
     Wrapper for special models like hybrid GDN, so we don't

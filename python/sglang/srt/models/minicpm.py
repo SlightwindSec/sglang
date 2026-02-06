@@ -14,22 +14,27 @@
 """Inference-only MiniCPM model compatible with HuggingFace weights."""
 
 import math
-import os
-import warnings
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import SimpleGLAAttnBackend
+from sglang.srt.layers.attention.minicpm_sparse_utils import (
+    SparseBatchAnalyzer,
+    SparseConfig,
+    SparseMetadata,
+    SparseMetadataBuilder,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
-    ColumnParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -43,10 +48,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
 
-from fla.ops.simple_gla import chunk_simple_gla
-from fla.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
-
-from sglang.srt.layers.attention.hybrid_linear_attn_backend import SimpleGLAAttnBackend
 
 class MiniCPMMLP(nn.Module):
     def __init__(
@@ -186,13 +187,13 @@ class MiniCPMAttention(nn.Module):
             q, k = q.float(), k.float()
             q, k = self.rotary_emb(positions, q, k)
             q, k = q.to(orig_dtype), k.to(orig_dtype)
-    
+
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.use_output_gate:
             o_gate_output, _ = self.o_gate(hidden_states)
             attn_output = attn_output * F.sigmoid(o_gate_output)
-                
+
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -224,7 +225,7 @@ class MiniCPMLightningMixer(nn.Module):
         use_output_norm: bool = False,
         qk_norm: bool = True,
         rope_head_dim: Optional[int] = None,
-        scale: str = '1/sqrt(d)',
+        scale: str = "1/sqrt(d)",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -239,9 +240,9 @@ class MiniCPMLightningMixer(nn.Module):
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.head_dim = head_dim
-        if scale == '1/sqrt(d)':
+        if scale == "1/sqrt(d)":
             self.scale = self.head_dim ** (-0.5)
-        elif scale == '1/d':
+        elif scale == "1/d":
             self.scale = self.head_dim ** (-1.0)
         else:
             self.scale = 1.0
@@ -251,7 +252,9 @@ class MiniCPMLightningMixer(nn.Module):
         self.use_rope = use_rope
         self.qk_norm = qk_norm
         self.use_output_norm = use_output_norm
-        self.rope_head_dim = rope_head_dim if rope_head_dim is not None else self.head_dim
+        self.rope_head_dim = (
+            rope_head_dim if rope_head_dim is not None else self.head_dim
+        )
         assert self.rope_head_dim <= self.head_dim
 
         self.q_size = self.num_heads * self.head_dim
@@ -268,7 +271,7 @@ class MiniCPMLightningMixer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
-        
+
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -276,11 +279,9 @@ class MiniCPMLightningMixer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
-        
+
         if self.use_output_norm:
-            self.o_norm = RMSNorm(
-                self.num_heads * self.head_dim, eps=self.rms_norm_eps
-            )
+            self.o_norm = RMSNorm(self.num_heads * self.head_dim, eps=self.rms_norm_eps)
 
         if self.use_output_gate:
             self.z_proj = ColumnParallelLinear(
@@ -339,13 +340,13 @@ class MiniCPMLightningMixer(nn.Module):
 
         # Get backend from forward batch
         attn_backend = forward_batch.attn_backend
-        if not hasattr(attn_backend, 'linear_attn_backend'):
+        if not hasattr(attn_backend, "linear_attn_backend"):
             raise RuntimeError(
                 "SimpleGLAAttnBackend requires HybridLinearAttnBackend but got "
                 f"{type(attn_backend).__name__}. This mixer should only be used for "
                 "MiniCPM hybrid models."
             )
-        
+
         linear_attn_backend = attn_backend.linear_attn_backend
         if not isinstance(linear_attn_backend, SimpleGLAAttnBackend):
             raise RuntimeError(
@@ -365,17 +366,18 @@ class MiniCPMLightningMixer(nn.Module):
         )
 
         o = o.reshape(-1, self.num_heads * self.head_dim)
-        
+
         if self.use_output_norm:
             o = self.o_norm(o)
 
         if self.use_output_gate:
             z, _ = self.z_proj(hidden_states)
             o = o * F.sigmoid(z)
-        
+
         y, _ = self.o_proj(o)
         return y
-    
+
+
 class MiniCPMDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -386,12 +388,13 @@ class MiniCPMDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         if hasattr(config, "mixer_types") and config.mixer_types is not None:
             self.mixer_type = config.mixer_types[layer_id]
         else:
             self.mixer_type = "minicpm4"
-        
+
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
@@ -405,8 +408,14 @@ class MiniCPMDecoderLayer(nn.Module):
                 rope_scaling=rope_scaling,
                 max_position_embeddings=max_position_embeddings,
                 quant_config=quant_config,
-                attn_use_rope=config.attn_use_rope if hasattr(config, "attn_use_rope") else True,
-                use_output_gate=config.attn_use_output_gate if hasattr(config, "attn_use_output_gate") else False,
+                attn_use_rope=(
+                    config.attn_use_rope if hasattr(config, "attn_use_rope") else True
+                ),
+                use_output_gate=(
+                    config.attn_use_output_gate
+                    if hasattr(config, "attn_use_output_gate")
+                    else False
+                ),
                 prefix=add_prefix("self_attn", prefix),
             )
         elif self.mixer_type in ["lightning", "lightning_attn", "lightning-attn"]:
@@ -445,6 +454,25 @@ class MiniCPMDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+    def _compute_topk(self, forward_batch, base_metadata, sparse_metadata):
+        """Compute TopK indices for sparse attention.
+
+        For decode mode, TopK is simple: just use the precomputed sparse_page_table.
+        For prefill mode, we need to compute TopK using kernel calls (deferred for now).
+
+        Args:
+            forward_batch: Forward batch
+            base_metadata: Base metadata
+            sparse_metadata: SparseMetadata to update with topk_indices
+        """
+        if forward_batch.forward_mode.is_decode_or_idle():
+            # Decode path: TopK is just the precomputed page table
+            sparse_metadata.topk_indices = base_metadata.sparse_page_table
+        else:
+            # Prefill path: Complex - needs kernel calls with compressed K1/K2
+            # For now, leave topk_indices as None, backend will compute it
+            # TODO: Implement full TopK computation in prefill mode
+            pass
 
     def forward(
         self,
@@ -453,6 +481,8 @@ class MiniCPMDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Build sparse metadata (model-specific logic!)
+
         # Self Attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)

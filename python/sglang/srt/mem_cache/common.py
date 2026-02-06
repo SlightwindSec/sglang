@@ -493,12 +493,14 @@ def alloc_paged_token_slots_decode(
     return out_cache_loc
 
 
-def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     Allocate KV cache for decode batch and write to req_to_token_pool.
 
     Returns:
         out_cache_loc: allocated cache locations
+        sparse_k1_loc: allocated sparse K1 cache locations (None if not needed)
+        sparse_k2_loc: allocated sparse K2 cache locations (None if not needed)
     """
     if isinstance(batch.tree_cache, SWAChunkCache):
         for req in batch.reqs:
@@ -516,10 +518,8 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
         if batch.token_sum_sparse_k1 > 0:
             sparse_k1_loc = alloc_token_slots(batch.tree_cache, batch.token_sum_sparse_k1)
-            # print("alloc sparse_k1_loc {}, bs is {}, seq_lens is {}".format(self.sparse_k1_loc, bs, self.seq_lens))
         if batch.token_sum_sparse_k2 > 0:
             sparse_k2_loc = alloc_token_slots(batch.tree_cache, batch.token_sum_sparse_k2)
-            # print("alloc sparse_k2_loc {}, bs is {}, seq_lens is {}".format(self.sparse_k2_loc, bs, self.seq_lens))
     else:
         # Paged allocation
         last_loc = batch.req_to_token_pool.req_to_token[
