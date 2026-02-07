@@ -1226,7 +1226,9 @@ class SparseMetadataBuilder:
 
         for b in range(bs):
             if forward_batch.seq_lens_cpu[b] >= dense_len:
-                if cache_seqlens[b] % block_size == 0:
+                if forward_batch.seq_lens_cpu[b] <= sparse_topk * block_size:
+                    sparse_cache_len = forward_batch.seq_lens_cpu[b]
+                elif cache_seqlens[b] % block_size == 0:
                     sparse_cache_len = sparse_topk * block_size
                 else:
                     sparse_cache_len = block_size * (sparse_topk - 1) + (

@@ -223,7 +223,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         self.init_blocks = hf_config.sparse_init_blocks
         self.block_size = hf_config.sparse_block_size
         self.window_size = hf_config.sparse_window_size
-        self.dense_len = hf_config.sparse_dense_len
+        self.dense_len = 0
         topk = hf_config.sparse_topk
         self.use_nope = hf_config.sparse_use_nope
         self.local_blocks = self.window_size // self.block_size  # local_blocks
@@ -1437,7 +1437,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             metadata.k2.cu_seqlens = self.decode_cuda_graph_metadata["k2.cu_seqlens"][
                 : batch_size + 1
             ]
-            assume_kv_len = self.dense_len
+            assume_kv_len = 8192
             assume_k1_len = (
                 assume_kv_len - self.k1_kernel_size
             ) // self.k1_kernel_stride + 1
