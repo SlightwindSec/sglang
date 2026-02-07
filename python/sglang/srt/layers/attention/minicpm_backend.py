@@ -1537,11 +1537,12 @@ class MiniCPMSparseBackend(AttentionBackend):
 
                 # Create FlashInfer wrapper with SLICE VIEWS
                 # FlashInfer captures the ADDRESSES of these slice views
-
+                # NOTE: use_tensor_cores=True is required for num_kv_heads=1 to avoid plan_info=None bug
                 flashinfer_wrapper = BatchDecodeWithPagedKVCacheWrapper(
                     self.attention_kernel.decode_workspace,
                     "NHD",
                     use_cuda_graph=True,
+                    use_tensor_cores=True,
                     paged_kv_indptr_buffer=kv_indptr_view,  # Slice address captured
                     paged_kv_indices_buffer=kv_indices_view,  # Slice address captured
                     paged_kv_last_page_len_buffer=kv_last_page_len_view,  # Slice address

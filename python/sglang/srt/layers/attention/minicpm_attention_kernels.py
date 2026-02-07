@@ -217,9 +217,11 @@ class FlashInferKernel(AttentionKernel):
         if self.decode_wrapper is None:
             from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 
+            # NOTE: use_tensor_cores=True is required for num_kv_heads=1 to avoid plan_info=None bug
             self.decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
                 self.decode_workspace,
                 self.kv_layout,
+                use_tensor_cores=True,
             )
         return self.decode_wrapper
 
