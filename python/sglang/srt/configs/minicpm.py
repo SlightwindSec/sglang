@@ -89,6 +89,7 @@ class MiniCPMHybridConfig(PretrainedConfig):
         self.sparse_use_nope = sparse_use_nope
         # Load sparse_config from original config if available (for backward compatibility)
         sparse_config = kwargs.pop("sparse_config", None)
+        self.has_sparse_config = sparse_config is not None
         if sparse_config is not None:
             self.sparse_block_size = sparse_config.get("block_size", self.sparse_block_size)
             self.sparse_dense_len = sparse_config.get("dense_len", self.sparse_dense_len)
@@ -98,6 +99,7 @@ class MiniCPMHybridConfig(PretrainedConfig):
             self.sparse_topk = sparse_config.get("topk", self.sparse_topk)
             self.sparse_window_size = sparse_config.get("window_size", self.sparse_window_size)
             self.sparse_use_nope = sparse_config.get("use_nope", self.sparse_use_nope)
+
 
     @property
     def mamba2_cache_params(self):
@@ -137,19 +139,28 @@ class MiniCPMHybridConfig(PretrainedConfig):
     @property
     def has_sparse_attention(self) -> bool:
         """Check if this config has sparse attention layers (minicpm4 mixer type)."""
-        return any(mt == "minicpm4" for mt in self.mixer_types)
+        return self.has_sparse_config and (self.mixer_types is None or any(mt == "minicpm4" for mt in self.mixer_types))
 
     @property
     def has_lightning_layers(self) -> bool:
         """Check if this config has lightning attention layers."""
-        return any(mt in ["lightning", "lightning_attn", "lightning-attn"] for mt in self.mixer_types)
+        return self.mixer_types is not None and any(mt in ["lightning", "lightning_attn", "lightning-attn"] for mt in self.mixer_types)
 
     @property
     def sparse_layer_ids(self) -> list:
         """Get the indices of layers with sparse attention."""
-        return [i for i, mt in enumerate(self.mixer_types) if mt == "minicpm4"]
+        if self.has_sparse_config:
+            if self.mixer_types is None:
+                return list(range(self.num_hidden_layers))
+            else:
+                return [i for i, mt in enumerate(self.mixer_types) if mt == "minicpm4"]
+        else:
+            return []
 
     @property
     def lightning_layer_ids(self) -> list:
         """Get the indices of layers with lightning attention."""
-        return [i for i, mt in enumerate(self.mixer_types) if mt in ["lightning", "lightning_attn", "lightning-attn"]]
+        if self.mixer_types is None:
+            return []
+        else:
+            return [i for i, mt in enumerate(self.mixer_types) if mt in ["lightning", "lightning_attn", "lightning-attn"]]

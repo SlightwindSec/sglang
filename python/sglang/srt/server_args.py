@@ -531,6 +531,7 @@ class ServerArgs:
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     fuse_topk: bool = False
+    force_dense_minicpm: bool = False
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
     enable_layerwise_nvtx_marker: bool = False
@@ -1513,6 +1514,12 @@ class ServerArgs:
                         )
                         self.disable_radix_cache = True
                         self.disable_overlap_schedule = False
+        elif model_arch in ["MiniCPMForCausalLM"]:
+            if self.force_dense_minicpm:
+                if self.attention_backend == "minicpm_flashattn":
+                    self.attention_backend = "fa3"
+                elif self.attention_backend == "minicpm_flashinfer":
+                    self.attention_backend = "flashinfer"
 
         if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
             self.disable_overlap_schedule = True
@@ -3999,6 +4006,11 @@ class ServerArgs:
             "--fuse-topk",
             action="store_true",
             help="fuse stage1+maxpool+topk in minicpm into a single kernel",
+        )
+        parser.add_argument(
+            "--force-dense-minicpm",
+            action="store_true",
+            help="Force dense attention in minicpm",
         )
         parser.add_argument(
             "--enable-profile-cuda-graph",
