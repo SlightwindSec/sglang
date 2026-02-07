@@ -1569,8 +1569,8 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
 
         mamba_indices = self._get_mamba_indices(forward_batch)
         initial_state = None
-        has_initial_state = forward_batch.forward_mode.is_decode() or forward_batch.extend_prefix_lens > 0
-        if has_initial_state:
+        has_initial_state = forward_batch.extend_prefix_lens is not None and forward_batch.extend_prefix_lens > 0
+        if forward_batch.forward_mode.is_decode() or has_initial_state.any():
             cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
             if cache_idx is not None:
                 layer_cache = self.req_to_token_pool.mamba_pool.mamba2_layer_cache(cache_idx)

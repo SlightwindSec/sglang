@@ -836,7 +836,7 @@ class SparseMetadataBuilder:
                 dtype=torch.int32,
                 device=cu_seqlens_q.device,
             )
-            + extend_prefix_lens
+            + extend_prefix_lens[sparse_bs_list]
         )
 
         return seqlen_q_sparse_bs, seqlen_k_sparse_bs_tensor
