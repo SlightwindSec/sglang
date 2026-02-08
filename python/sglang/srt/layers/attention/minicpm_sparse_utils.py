@@ -26,7 +26,10 @@ from infllm_v2 import infllmv2_attn_stage1, max_pooling_1d_varlen
 
 from sglang.srt.layers.attention.minicpm_sparse_kernels import (
     compress_k_complete_kernel_new,
+    compress_k_complete_kernel_new_padded,
 )
+
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +204,124 @@ def get_compress_k_v2(
     return
 
 
+def compress_k_core_new_padded(
+    full_compressed_k,  # output
+    layer,
+    batch,
+    k_stride,
+    key_cache,
+    token_table,
+    compressed_k_table,
+    new_k_token_nums,
+    cu_new_k_token_nums,
+    history_compress_k_token_nums,
+    cu_new_compress_k_token_nums,
+    new_compress_k_token_nums,
+    total_compress_k_token_nums,
+    cu_total_compress_k_token_nums,
+    kernel_size,
+    kernel_stride,
+    max_context_length,
+):
+    """Padded layout version: stores data in batch-major order for reshape compatibility."""
+    head_num_k = key_cache.shape[1]
+    head_dim = key_cache.shape[2]
+
+    # Compute max_chunks_per_seq for padded layout
+    # Must match: batch_size * max_context_length // kernel_stride
+    max_chunks_per_seq = max_context_length // kernel_stride
+
+    BLOCK_SIZE = triton.next_power_of_2(head_dim)
+    grid = (batch, max_chunks_per_seq, head_num_k)
+
+    compress_k_complete_kernel_new_padded[grid](
+        key_cache,
+        token_table,
+        cu_new_k_token_nums,
+        history_compress_k_token_nums,
+        k_stride,
+        compressed_k_table,
+        cu_new_compress_k_token_nums,
+        cu_total_compress_k_token_nums,
+        total_compress_k_token_nums,
+        full_compressed_k,
+        batch,
+        max_chunks_per_seq,
+        token_table.shape[1],
+        compressed_k_table.shape[1],
+        head_num_k,
+        head_dim,
+        kernel_size,
+        kernel_stride,
+        BLOCK_SIZE,
+    )
+    return
+
+
+def get_compress_k_v2_padded(
+    layer,
+    forward_batch,
+    metadata: "FlashAttentionMetadata",
+    full_compressed_k1,
+    full_compressed_k2,
+    max_context_length,
+):
+    """Padded layout version for debugging with reshape()."""
+    batch = len(forward_batch.req_pool_indices)
+
+    k1_stride = 16
+    k1_l = 32
+    k2_stride = 64
+    k2_l = 128
+
+    key_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+    key_cache = key_cache.view(-1, layer.tp_k_head_num, layer.head_dim)
+
+    # deal with k1
+    compress_k_core_new_padded(
+        full_compressed_k1,
+        layer,
+        batch,
+        k1_stride,
+        key_cache,
+        metadata.page_table,
+        metadata.k1.table,
+        metadata.k1.new_token_nums,
+        metadata.k1.cu_new_token_nums,
+        metadata.k1.history_compress_token_nums,
+        metadata.k1.cu_new_compress_token_nums,
+        metadata.k1.new_compress_token_nums,
+        metadata.k1.total_compress_token_nums,
+        metadata.k1.cu_total_compress_token_nums,
+        k1_l,
+        k1_stride,
+        max_context_length,
+    )
+
+    # deal with k2
+    compress_k_core_new_padded(
+        full_compressed_k2,
+        layer,
+        batch,
+        k2_stride,
+        key_cache,
+        metadata.page_table,
+        metadata.k2.table,
+        metadata.k2.new_token_nums,
+        metadata.k2.cu_new_token_nums,
+        metadata.k2.history_compress_token_nums,
+        metadata.k2.cu_new_compress_token_nums,
+        metadata.k2.new_compress_token_nums,
+        metadata.k2.total_compress_token_nums,
+        metadata.k2.cu_total_compress_token_nums,
+        k2_l,
+        k2_stride,
+        max_context_length,
+    )
+
+    return
+
+
 def allocate_and_compress_keys(
     layer,
     forward_batch,
@@ -210,6 +331,7 @@ def allocate_and_compress_keys(
     dtype: torch.dtype = torch.bfloat16,
     device: torch.device = None,
     max_context_length: int = 32768,
+    split_stage1: bool = False,
 ):
     """Allocate compressed key tensors and run compression.
 
@@ -222,6 +344,7 @@ def allocate_and_compress_keys(
         dtype: Tensor data type (default: bfloat16)
         device: Tensor device (default: layer device)
         max_context_length: Maximum context length for the model (default: 32768)
+        split_stage1: If True, use padded kernel
 
     Returns:
         Tuple of (full_compressed_k1, full_compressed_k2)
@@ -238,10 +361,24 @@ def allocate_and_compress_keys(
         (k2_token_nums, layer.tp_k_head_num, layer.head_dim), dtype=dtype, device=device
     )
 
-    get_compress_k_v2(
-        layer, forward_batch, metadata, full_compressed_k1, full_compressed_k2,
-        max_context_length=max_context_length,
-    )
+    if split_stage1:
+        get_compress_k_v2_padded(
+            layer,
+            forward_batch,
+            metadata,
+            full_compressed_k1,
+            full_compressed_k2,
+            max_context_length=max_context_length,
+        )
+    else:
+        get_compress_k_v2(
+            layer,
+            forward_batch,
+            metadata,
+            full_compressed_k1,
+            full_compressed_k2,
+            max_context_length=max_context_length,
+        )
 
     return full_compressed_k1, full_compressed_k2
 
@@ -1506,6 +1643,7 @@ __all__ = [
     "SparseMetadataBuilder",
     "batched_gather",
     "get_compress_k_v2",
+    "get_compress_k_v2_padded",
     "allocate_and_compress_keys",
     "compressed_attention",
 ]

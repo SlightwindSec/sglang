@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.minicpm_sparse_utils import (
     allocate_and_compress_keys,
     compressed_attention,
     get_compress_k_v2,
+    get_compress_k_v2_padded,
     compressed_attention_tilelang,
 )
 
@@ -645,6 +646,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 dtype=key_states.dtype,
                 device=key_states.device,
                 max_context_length=self.max_context_len,
+                split_stage1=self.split_stage1,
             )
 
             pt_k1, pt_k2 = 0, 0
@@ -714,14 +716,24 @@ class MiniCPMSparseBackend(AttentionBackend):
             metadata = self.forward_metadata
 
             if self.enable_cuda_graph:
-                get_compress_k_v2(
-                    layer=layer,
-                    forward_batch=forward_batch,
-                    metadata=metadata,
-                    full_compressed_k1=self.decode_cuda_graph_metadata["compress_k1"][:forward_batch.batch_size * self.max_context_len // self.k1_kernel_stride, :, :],
-                    full_compressed_k2=self.decode_cuda_graph_metadata["compress_k2"][:forward_batch.batch_size * self.max_context_len // self.k2_kernel_stride, :, :],
-                    max_context_length=self.max_context_len,
-                )
+                if self.split_stage1:
+                    get_compress_k_v2_padded(
+                        layer=layer,
+                        forward_batch=forward_batch,
+                        metadata=metadata,
+                        full_compressed_k1=self.decode_cuda_graph_metadata["compress_k1"][:forward_batch.batch_size * self.max_context_len // self.k1_kernel_stride, :, :],
+                        full_compressed_k2=self.decode_cuda_graph_metadata["compress_k2"][:forward_batch.batch_size * self.max_context_len // self.k2_kernel_stride, :, :],
+                        max_context_length=self.max_context_len,
+                    )
+                else:
+                    get_compress_k_v2(
+                        layer=layer,
+                        forward_batch=forward_batch,
+                        metadata=metadata,
+                        full_compressed_k1=self.decode_cuda_graph_metadata["compress_k1"][:forward_batch.batch_size * self.max_context_len // self.k1_kernel_stride, :, :],
+                        full_compressed_k2=self.decode_cuda_graph_metadata["compress_k2"][:forward_batch.batch_size * self.max_context_len // self.k2_kernel_stride, :, :],
+                        max_context_length=self.max_context_len,
+                    )
             else:
                 compressed_k, compressed_k2 = allocate_and_compress_keys(
                     layer=layer,
@@ -736,6 +748,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                     dtype=torch.bfloat16,
                     device=self.device,
                     max_context_length=self.max_context_len,
+                    split_stage1=self.split_stage1,
                 )
 
             topk_metadata = self.sparse_metadata_builder.build_decode_topk_metadata(
@@ -962,6 +975,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 dtype=k.dtype,
                 device=k.device,
                 max_context_length=self.max_context_len,
+                split_stage1=self.split_stage1,
             )
 
         q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num // 2, layer.head_dim)
