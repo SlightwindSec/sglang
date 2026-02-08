@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.minicpm_sparse_utils import (
     allocate_and_compress_keys,
     compressed_attention,
     get_compress_k_v2,
+    compressed_attention_tilelang,
 )
 
 
@@ -243,6 +244,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         self.k2_kernel_stride = self.kernel_stride * 4
 
         self.fuse_topk = model_runner.server_args.fuse_topk
+        self.split_stage1 = model_runner.server_args.split_stage1
 
 
         max_cache_len = self.max_context_len
@@ -260,6 +262,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         # FIXME: Read from model config
         dtype_str = "bfloat16"
         self.decode_fused_kernels = {}
+        self.prefill_fused_kernels = {}
         bucketed_pooled_k_len = _bucket_size(pooled_k_len)
 
         pooling_block_stride = self.block_size // self.kernel_stride  # = 64 // 16 = 4
@@ -269,7 +272,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         if model_runner.server_args.fuse_topk:
             print("jit start...")
             for bs in range(1, model_runner.server_args.max_running_requests + 1):
-                kernel = fused_attn_pooling_online_topk_decode(
+                decode_kernel = fused_attn_pooling_online_topk_decode(
                     batch_size=bs,
                     groups=self.heads_per_group,
                     heads=model_runner.model_config.num_attention_heads,
@@ -285,7 +288,27 @@ class MiniCPMSparseBackend(AttentionBackend):
                     local_blocks=self.local_blocks,
                     dtype_str=dtype_str
                 )
-                self.decode_fused_kernels[bs] = kernel
+                self.decode_fused_kernels[bs] = decode_kernel
+                prefill_kernel = fused_attn_pooling_online_topk_prefill(
+                    batch_size=bs,
+                    groups=self.heads_per_group,
+                    heads=model_runner.model_config.num_attention_heads,
+                    dim=self.head_dim,
+                    topk=kernel_topk,
+                    max_seqlen_q_grid=model_runner.server_args.chunked_prefill_size,  # Bucketed for grid
+                    pooled_k_len=bucketed_pooled_k_len,
+                    # actual_max_seqlen_q=bucketed_actual_max_seqlen_q,  # Bucketed for causal mask
+                    # actual_max_seqlen_k=bucketed_actual_max_seqlen_k,  # Bucketed for causal mask
+                    m_block_dim=16,
+                    block_stride=pooling_block_stride,
+                    pad_len=pooling_pad_len,
+                    num_offs=pooling_num_offs,
+                    block_size=self.block_size,
+                    init_blocks=self.init_blocks,
+                    local_blocks=self.local_blocks,
+                    dtype_str=dtype_str
+                )
+                self.prefill_fused_kernels[bs] = prefill_kernel
             print("jit end...")
 
         # Initialize attention kernel
@@ -379,6 +402,8 @@ class MiniCPMSparseBackend(AttentionBackend):
                     seqlen_q_sparse_bs,
                 )
             )
+            metadata.token_to_bs = metadata.token_to_bs.to(device=metadata.cu_seqlens_q.device)
+            metadata.token_pos_in_bs = metadata.token_pos_in_bs.to(device=metadata.cu_seqlens_q.device)
 
             prefill_metadata = (
                 self.sparse_metadata_builder.build_sparse_prefill_metadata(
@@ -408,8 +433,6 @@ class MiniCPMSparseBackend(AttentionBackend):
 
             # Stage1 optimization metadata for prefill mode
             metadata.cache_seqlens_int32_stage1 = metadata.cache_seqlens_int32 - 1
-            # metadata.cu_seqlens_q_adjusted = metadata.cu_seqlens_q * self.heads_per_group
-            # metadata.max_seqlen_q_adjusted = metadata.max_seq_len_q * self.heads_per_group
             seqlens_q_sparse_list = []
             for i in range(forward_batch.batch_size):
                 if forward_batch.seq_lens_cpu[i] >= self.dense_len:
@@ -549,6 +572,48 @@ class MiniCPMSparseBackend(AttentionBackend):
     ):
         if is_prefill:
 
+            all_sparse = forward_batch.sparse_batch_size == forward_batch.batch_size
+            if all_sparse:
+                # all batch is sparse
+                metadata = self.forward_metadata
+                compressed_k = torch.zeros(
+                    (forward_batch.batch_size * self.max_context_len // self.k1_kernel_stride, self.head_group_num, self.head_dim),
+                    dtype=torch.bfloat16,
+                    device=self.device
+                        )
+                compressed_k2 = torch.zeros(
+                    (forward_batch.batch_size * self.max_context_len // self.k2_kernel_stride, self.head_group_num, self.head_dim), 
+                    dtype=torch.bfloat16, 
+                    device=self.device
+                )
+
+                get_compress_k_v2(
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    metadata=metadata,
+                    full_compressed_k1=compressed_k, # output
+                    full_compressed_k2=compressed_k2, # output
+                    max_context_length=self.max_context_len,
+                )
+                
+                cu_seqlens_k = metadata.cu_seqlens_k
+                max_seqlen_in_batch_k = metadata.max_seq_len_k
+                cu_seqlens_q = metadata.cu_seqlens_q
+                max_seqlen_in_batch_q = metadata.max_seq_len_q
+                
+                ret = self.sparse_get_topk_impl(
+                            query_states,
+                            cu_seqlens_q,
+                            cu_seqlens_k,
+                            max_seqlen_in_batch_q,
+                            max_seqlen_in_batch_k,
+                            no_rope_param=no_rope_param,
+                            compressed_k=compressed_k, compressed_cu_seqlens=metadata.k1.cu_seqlens,
+                            compressed_k2=compressed_k2, compressed_cu_seqlens2=metadata.k2.cu_seqlens,
+                            fused_kernel=self.prefill_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None
+                )
+                return ret
+
             topk_metadata = self.sparse_metadata_builder.build_prefill_topk_metadata(
                 forward_batch=forward_batch,
                 base_metadata=self.forward_metadata,
@@ -640,7 +705,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 compressed_cu_seqlens=compressed_cu_seqlens,
                 compressed_k2=compressed_k2,
                 compressed_cu_seqlens2=compressed_cu_seqlens2,
-                decode_fused_kernel=self.decode_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None
+                fused_kernel=self.prefill_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None
             )
             return ret
         else:
@@ -695,7 +760,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                     compressed_cu_seqlens=metadata.k1.cu_seqlens,
                     compressed_k2=self.decode_cuda_graph_metadata["compress_k2"],
                     compressed_cu_seqlens2=metadata.k2.cu_seqlens,
-                    decode_fused_kernel=self.decode_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None
+                    fused_kernel=self.decode_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None
                 )
 
             else:
@@ -710,7 +775,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                     compressed_cu_seqlens=metadata.k1.cu_seqlens,
                     compressed_k2=compressed_k2,
                     compressed_cu_seqlens2=metadata.k2.cu_seqlens,
-                    decode_fused_kernel=self.decode_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None
+                    fused_kernel=self.decode_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None
                 )
 
         return ret
@@ -727,7 +792,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         compressed_cu_seqlens=None,
         compressed_k2=None,
         compressed_cu_seqlens2=None,
-        decode_fused_kernel=None
+        fused_kernel=None
     ):
         cache_lens = None
         if max_seqlen_in_batch_k > max_seqlen_in_batch_q:
@@ -764,6 +829,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 cu_seqlens_q_adjusted=self.forward_metadata.cu_seqlens_q_adjusted,
                 max_seqlen_q_adjusted=self.forward_metadata.max_seqlen_q_adjusted,
                 # block_score_buffer=self.forward_metadata.block_score_buffer
+                split_stage1=self.split_stage1,
             )
         else:
             topk_idx = compressed_attention_tilelang(
@@ -783,7 +849,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 init_blocks=self.init_blocks,
                 local_blocks=self.local_blocks,
                 cache_lens=cache_lens,
-                decode_fused_kernel=decode_fused_kernel,
+                fused_kernel=fused_kernel,
                 max_cache_len=self.max_context_len,
             )
 
@@ -863,24 +929,24 @@ class MiniCPMSparseBackend(AttentionBackend):
 
         bs = forward_batch.batch_size
         if max(forward_batch.seq_lens_cpu) >= self.dense_len:
-            # split batch here
+            q_reshaped = q.contiguous().view(
+                -1, layer.tp_q_head_num, layer.head_dim
+            )
             topk_idx = self.get_topk_for_sparse(
-                q, k, v, q.shape[0], layer, forward_batch
+                q_reshaped, k, v, q.shape[0], layer, forward_batch
             )
 
             sparse_page_table_sparse_bs = sparse_kernel_extension.get_block_table_v2(
                 topk_idx,
                 page_table,
-                metadata.token_to_bs.to(topk_idx.device),
-                metadata.token_pos_in_bs.to(topk_idx.device),
-                metadata.seqlen_k_sparse_bs_tensor.to(topk_idx.device),
+                metadata.token_to_bs,
+                metadata.token_pos_in_bs,
+                metadata.seqlen_k_sparse_bs_tensor,
                 self.sparse_topk
             ).reshape(-1, self.num_sparse_topk_tokens)
 
             # copy page table for sparse bs
-            metadata.sparse_page_table[
-                forward_batch.sparse_idx, : sparse_page_table_sparse_bs.shape[1]
-            ] = sparse_page_table_sparse_bs
+            metadata.sparse_page_table[forward_batch.sparse_idx, :self.num_sparse_topk_tokens] = sparse_page_table_sparse_bs
         else:
             total_k1 = self.forward_metadata.k1.cu_total_compress_token_nums[-1].item()
             total_k2 = self.forward_metadata.k2.cu_total_compress_token_nums[-1].item()
@@ -927,12 +993,8 @@ class MiniCPMSparseBackend(AttentionBackend):
                 q_reshaped[ps : ps + len_, :, :] = t[0::2, :, :]
                 q_reshaped[ps + len_ : ps + 2 * len_, :, :] = t[1::2, :, :]
 
-                metadata.sparse_page_table[sparse_page_table_idx_start, :kv_len] = (
-                    page_table[dense_bs, :kv_len] * 2
-                )
-                metadata.sparse_page_table[sparse_page_table_idx_start + 1, :kv_len] = (
-                    page_table[dense_bs, :kv_len] * 2 + 1
-                )
+                metadata.sparse_page_table[sparse_page_table_idx_start, : kv_len] = page_table[dense_bs, : kv_len] * 2
+                metadata.sparse_page_table[sparse_page_table_idx_start + 1, : kv_len] = page_table[dense_bs, : kv_len] * 2 + 1
 
         metadata.sparse_cache_seqlens_int32 = (
             (metadata.sparse_page_table != 0)
@@ -941,15 +1003,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         )
 
         # this seem not necessary to update perlayer
-        metadata.sparse_cu_seqlens_k = torch.cat(
-            [
-                torch.zeros(1, dtype=cu_seqlens_k.dtype, device=cu_seqlens_k.device),
-                torch.cumsum(
-                    metadata.sparse_cache_seqlens_int32, dim=0, dtype=cu_seqlens_k.dtype
-                ),
-            ],
-            dim=0,
-        )
+        metadata.sparse_cu_seqlens_k = F.pad(torch.cumsum(metadata.sparse_cache_seqlens_int32, dim=0, dtype=cu_seqlens_k.dtype), (1, 0))
 
         key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
             layer.layer_id
@@ -1011,8 +1065,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 result[ps : ps + 2 * len_ : 2, :, :] = t[0:len_, :, :]
                 result[ps + 1 : ps + 2 * len_ : 2, :, :] = t[len_ : 2 * len_, :, :]
 
-        attn_output = result.reshape(q.shape[0], layer.tp_q_head_num * layer.head_dim)
-        return attn_output
+        return result.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_decode(
         self,

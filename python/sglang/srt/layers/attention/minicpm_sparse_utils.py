@@ -267,6 +267,7 @@ def compressed_attention(
     total_q: int = -1,
     cu_seqlens_q_adjusted: Optional[torch.Tensor] = None,
     max_seqlen_q_adjusted: Optional[int] = None,
+    split_stage1: bool = False,
 ) -> torch.Tensor:
     """Compressed attention computation for sparse attention.
 
@@ -328,17 +329,46 @@ def compressed_attention(
         # else:
         #     q_idx = cache_lens // block_size
 
-        score = infllmv2_attn_stage1(
-            q.contiguous(),
-            k.contiguous(),
-            k2.contiguous(),
-            cu_seqlens_q=cu_seqlens_q_adjusted,
-            cu_seqlens_k=cu_seqlens_k,
-            cu_seqlens_v=cu_seqlens_k2,
-            max_seqlen_q=max_seqlen_q_adjusted,
-            max_seqlen_k=max_context_len // kernel_stride,
-            causal=is_prefilling,
-        )
+
+        # split-stage1 -> bmm+softmax+reduce_sum
+        if not is_prefilling and split_stage1:
+            batch_size = q.shape[0]
+            k1_len = k.shape[0]
+            q_head = q.shape[1]
+            kv_head = k.shape[1]
+            group_size = q_head // kv_head
+            head_dim = k.shape[2]
+            q_reshape = (
+                q.reshape(batch_size, 1, q_head, head_dim)
+                    .transpose(1, 2)
+                    .reshape(batch_size, kv_head, group_size, head_dim)
+                    .transpose(0, 1)
+                    .reshape(-1, group_size, head_dim)
+            )
+            k_reshape = (
+                k.reshape(batch_size, k1_len // batch_size, kv_head, head_dim)
+                .transpose(1, 2)
+                .transpose(-2, -1)
+                .transpose(0, 1)
+                .reshape(-1, head_dim, k1_len // batch_size)
+            )
+    
+            scale = 1.0 / math.sqrt(head_dim)
+            score = torch.bmm(q_reshape, k_reshape) * scale
+            score = F.softmax(score, dim=-1)
+            score = score.reshape(kv_head, batch_size, group_size, k1_len // batch_size).sum(dim=2)
+        else:  
+            score = infllmv2_attn_stage1(
+                q.contiguous(),
+                k.contiguous(),
+                k2.contiguous(),
+                cu_seqlens_q=cu_seqlens_q_adjusted,
+                cu_seqlens_k=cu_seqlens_k,
+                cu_seqlens_v=cu_seqlens_k2,
+                max_seqlen_q=max_seqlen_q_adjusted,
+                max_seqlen_k=max_context_len // kernel_stride,
+                causal=is_prefilling
+            )
 
         block_score = max_pooling_1d_varlen(
             score.contiguous(),
@@ -380,7 +410,7 @@ def compressed_attention_tilelang(
     init_blocks: int = 1,
     local_blocks: int = 2,
     cache_lens=None,
-    decode_fused_kernel=None,
+    fused_kernel=None,
     max_cache_len=-1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -388,13 +418,14 @@ def compressed_attention_tilelang(
     """
     with torch.no_grad():
         batch_size = cu_seqlens_q.shape[0] - 1
-        
+
         # Check if it's prefilling stage
         # Use max_seqlen_q > 1 to avoid .item() call for CUDA Graph compatibility
         is_prefilling = cache_lens is None or max_seqlen_q > 1
-        
+
         # Fixed max_cache_len for CUDA Graph compatibility (avoid .item() calls)
-        # max_cache_len = 32768  # 512k
+        # max_cache_len = 525312  # 512k
+
 
         # Get tensor dimensions
         # q shape: [total_q_len, num_kv_heads, groups, head_dim] or [total_q_len, num_heads, head_dim]
@@ -403,7 +434,7 @@ def compressed_attention_tilelang(
         total_k_len = k.shape[0]
         num_kv_heads = k.shape[1]
         head_dim = k.shape[2]
-        
+
         # Determine num_heads and groups
         # if q.dim() == 4:
         #     groups = q.shape[2]
@@ -417,9 +448,9 @@ def compressed_attention_tilelang(
         # Need to reshape to [total_q_len * groups, num_kv_heads, head_dim]
         q_kernel = q.view(total_q_len, num_kv_heads, groups, head_dim)
         q_kernel = q_kernel.transpose(1, 2).reshape(total_q_len * groups, num_kv_heads, head_dim).contiguous()
-        
+
         k_kernel = k.contiguous()
-        
+
         # Compute pooled_k_len using infllmv2 formula (based on block count):
         # total_len = max_seqlen_q + cache_len
         # out_len = (total_len + block_size - 1) // block_size
@@ -431,9 +462,11 @@ def compressed_attention_tilelang(
             # Decode: use fixed max_cache_len for CUDA Graph compatibility
             # Kernel uses actual_pooled_k_len internally for dynamic bounds checking
             pooled_k_len = (max_cache_len + block_size - 1) // block_size
-            assert decode_fused_kernel is not None, "decode_fused_kernel is not initialized"
-        
-        
+            # assert decode_fused_kernel is not None, "decode_fused_kernel is not initialized"
+
+        assert fused_kernel is not None, "fused_kernel is not initialized"
+
+
         # Pooling parameters - aligned with infllmv2_cuda_impl:
         # block_stride = block_size // kernel_stride = 64 // 16 = 4
         # pad_len = kernel_size // kernel_stride - 1 = 32 // 16 - 1 = 1
@@ -441,10 +474,10 @@ def compressed_attention_tilelang(
         pooling_block_stride = block_size // kernel_stride  # = 64 // 16 = 4
         pooling_pad_len = kernel_size // kernel_stride - 1  # = 32 // 16 - 1 = 1
         pooling_num_offs = kernel_size // kernel_stride + block_size // kernel_stride - 1  # = 2 + 4 - 1 = 5
-        
+
         # Compute actual output topk (same as original: min(topk, num_blocks))
         output_topk = min(topk, pooled_k_len)
-        
+
         # For the kernel, we need power of 2 topk
         topk_power2 = tilelang.math.next_power_of_2(output_topk)
         kernel_topk = min(topk_power2, pooled_k_len)
@@ -452,7 +485,7 @@ def compressed_attention_tilelang(
         if kernel_topk != tilelang.math.next_power_of_2(kernel_topk):
             kernel_topk = tilelang.math.next_power_of_2(kernel_topk) // 2
         kernel_topk = max(8, kernel_topk)  # Minimum topk for kernel
-        
+
         # Determine dtype string
         if q.dtype == torch.float16:
             dtype_str = "float16"
@@ -460,21 +493,22 @@ def compressed_attention_tilelang(
             dtype_str = "bfloat16"
         else:
             dtype_str = "bfloat16"
-        
+
         # Allocate output tensors
         topk_indices = torch.full((num_kv_heads, total_q_len, kernel_topk), -1, dtype=torch.int32, device=q.device)
         topk_values = torch.full((num_kv_heads, total_q_len, kernel_topk), float('-inf'), dtype=torch.float32, device=q.device)
-        
+
         if is_prefilling:
             # =================================================================
             # PREFILL: Use bucketed max_seqlen_q and pooled_k_len
             # Compiles once per unique bucket combination
+            # Supports chunk prefill with cache_lens tensor
             # =================================================================
-            bucketed_max_seqlen_q = _bucket_size(max_seqlen_q)
+            # bucketed_max_seqlen_q = _bucket_size(max_seqlen_q)
             bucketed_pooled_k_len = _bucket_size(pooled_k_len)
             # Also bucket actual_max_seqlen_q/k to reduce kernel recompilation
-            bucketed_actual_max_seqlen_q = _bucket_size(max_seqlen_q)
-            bucketed_actual_max_seqlen_k = _bucket_size(max_seqlen_k)
+            # bucketed_actual_max_seqlen_q = _bucket_size(max_seqlen_q)
+            # bucketed_actual_max_seqlen_k = _bucket_size(max_seqlen_k)
 
             # Prepare cache_lens tensor for chunk prefill support
             # For standard prefill: cache_lens is None -> use zeros
@@ -483,39 +517,21 @@ def compressed_attention_tilelang(
                 cache_lens_tensor = torch.zeros(batch_size, dtype=torch.int32, device=q.device)
             else:
                 cache_lens_tensor = cache_lens.to(torch.int32)
-            
-            kernel = fused_attn_pooling_online_topk_prefill(
-                batch_size=batch_size,
-                groups=groups,
-                heads=num_heads,
-                dim=head_dim,
-                topk=kernel_topk,
-                max_seqlen_q_grid=bucketed_max_seqlen_q,  # Bucketed for grid
-                pooled_k_len=bucketed_pooled_k_len,
-                actual_max_seqlen_q=bucketed_actual_max_seqlen_q,  # Bucketed for causal mask
-                actual_max_seqlen_k=bucketed_actual_max_seqlen_k,  # Bucketed for causal mask
-                m_block_dim=16,
-                block_stride=pooling_block_stride,
-                pad_len=pooling_pad_len,
-                num_offs=pooling_num_offs,
-                block_size=block_size,
-                init_blocks=init_blocks,
-                local_blocks=local_blocks,
-                dtype_str=dtype_str
-            )
-            
+
+
+
             # Run prefill kernel with cache_lens for chunk prefill support
-            kernel(q_kernel, k_kernel, cu_seqlens_q, cu_seqlens_k, cache_lens_tensor, topk_indices, topk_values)
+            fused_kernel(q_kernel, k_kernel, cu_seqlens_q, cu_seqlens_k, cache_lens_tensor, topk_indices, topk_values)
         else:
             # =================================================================
             # DECODE: max_seqlen_q=1 (fixed), cache_lens passed as tensor
             # Compiles ONCE and reuses for all decode steps!
             # =================================================================
             bucketed_pooled_k_len = _bucket_size(pooled_k_len)
-            
+
             # Prepare cache_lens as tensor (runtime value, not compile-time constant!)
             cache_lens_tensor = cache_lens.to(torch.int32)
-            
+
             # kernel = fused_attn_pooling_online_topk_decode(
             #     batch_size=batch_size,
             #     groups=groups,
@@ -532,14 +548,14 @@ def compressed_attention_tilelang(
             #     local_blocks=local_blocks,
             #     dtype_str=dtype_str
             # )
-            
+
             # Run decode kernel with cache_lens as tensor
-            decode_fused_kernel(q_kernel, k_kernel, cu_seqlens_q, cu_seqlens_k, cache_lens_tensor, topk_indices, topk_values)
-        
+            fused_kernel(q_kernel, k_kernel, cu_seqlens_q, cu_seqlens_k, cache_lens_tensor, topk_indices, topk_values)
+
         # Note: q_idx masking is handled inside the kernel via causal_mask
         # which sets scores to -1e9 for K blocks beyond the causal boundary.
         # These blocks won't be selected in topk due to their low scores.
-        
+
         # Sort with -1 values at the end (match original behavior)
         # Replace -1 with large value, sort, then replace back
         large_val = pooled_k_len + 1000  # Any value larger than max valid index
@@ -547,12 +563,11 @@ def compressed_attention_tilelang(
         topk_for_sort[topk_for_sort == -1] = large_val
         topk_idx = topk_for_sort.sort(-1).values
         topk_idx[topk_idx == large_val] = -1
-        
+
         # Truncate to output_topk (same as original: min(topk, num_blocks))
         topk_idx = topk_idx[:, :, :output_topk]
-        
-        return topk_idx
 
+        return topk_idx
 
 
 @dataclass
