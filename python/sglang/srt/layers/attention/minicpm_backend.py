@@ -225,7 +225,9 @@ class MiniCPMSparseBackend(AttentionBackend):
         self.init_blocks = hf_config.sparse_init_blocks
         self.block_size = hf_config.sparse_block_size
         self.window_size = hf_config.sparse_window_size
-        self.dense_len = 0
+        self.dense_as_sparse = model_runner.server_args.dense_as_sparse
+        self.dense_len = 0 if self.dense_as_sparse else hf_config.sparse_dense_len
+        self.config_dense_len = hf_config.sparse_dense_len
         topk = hf_config.sparse_topk
         self.use_nope = hf_config.sparse_use_nope
         self.local_blocks = self.window_size // self.block_size  # local_blocks
@@ -371,7 +373,7 @@ class MiniCPMSparseBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             metadata.sparse_bs_list = (
-                self.sparse_batch_analyzer.identify_sparse_batches(forward_batch)
+                self.sparse_batch_analyzer.identify_sparse_batches(forward_batch, self.dense_as_sparse)
             )
 
             seqlen_q_sparse_bs, metadata.seqlen_k_sparse_bs_tensor = (
@@ -716,8 +718,8 @@ class MiniCPMSparseBackend(AttentionBackend):
                     layer=layer,
                     forward_batch=forward_batch,
                     metadata=metadata,
-                    full_compressed_k1=self.decode_cuda_graph_metadata["compress_k1"],
-                    full_compressed_k2=self.decode_cuda_graph_metadata["compress_k2"],
+                    full_compressed_k1=self.decode_cuda_graph_metadata["compress_k1"][:forward_batch.batch_size * self.max_context_len // self.k1_kernel_stride, :, :],
+                    full_compressed_k2=self.decode_cuda_graph_metadata["compress_k2"][:forward_batch.batch_size * self.max_context_len // self.k2_kernel_stride, :, :],
                     max_context_length=self.max_context_len,
                 )
             else:
@@ -756,9 +758,9 @@ class MiniCPMSparseBackend(AttentionBackend):
                     max_seqlen_in_batch_q,
                     max_seqlen_in_batch_k,
                     no_rope_param=no_rope_param,
-                    compressed_k=self.decode_cuda_graph_metadata["compress_k1"],
+                    compressed_k=self.decode_cuda_graph_metadata["compress_k1"][:forward_batch.batch_size * self.max_context_len // self.k1_kernel_stride, :, :],
                     compressed_cu_seqlens=metadata.k1.cu_seqlens,
-                    compressed_k2=self.decode_cuda_graph_metadata["compress_k2"],
+                    compressed_k2=self.decode_cuda_graph_metadata["compress_k2"][:forward_batch.batch_size * self.max_context_len // self.k2_kernel_stride, :, :],
                     compressed_cu_seqlens2=metadata.k2.cu_seqlens,
                     fused_kernel=self.decode_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None
                 )
@@ -1501,7 +1503,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             metadata.k2.cu_seqlens = self.decode_cuda_graph_metadata["k2.cu_seqlens"][
                 : batch_size + 1
             ]
-            assume_kv_len = 8192
+            assume_kv_len = self.config_dense_len
             assume_k1_len = (
                 assume_kv_len - self.k1_kernel_size
             ) // self.k1_kernel_stride + 1
