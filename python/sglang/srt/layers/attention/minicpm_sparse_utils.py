@@ -99,8 +99,14 @@ def compress_k_core_new(
     #
     # All operations are in a single kernel, CUDA graph compatible.
 
+    # Limit grid size to avoid too many thread blocks
+    # If max_chunks_per_seq > max_grid_chunks, kernel will loop to handle remaining chunks
+    MAX_GRID_CHUNKS = 1024  # Adjustable limit for grid dimension
+    max_grid_chunks = min(max_chunks_per_seq, MAX_GRID_CHUNKS)
+
     BLOCK_SIZE = triton.next_power_of_2(head_dim)
-    grid = (batch, max_chunks_per_seq, head_num_k)
+    # Grid size is now limited, kernel uses loop to handle all chunks
+    grid = (batch, max_grid_chunks, head_num_k)
 
     compress_k_complete_kernel_new[grid](
         key_cache,
@@ -122,6 +128,7 @@ def compress_k_core_new(
         kernel_size,
         kernel_stride,
         BLOCK_SIZE,
+        max_grid_chunks,  # Pass the limit to kernel for loop control
     )
 
     return
