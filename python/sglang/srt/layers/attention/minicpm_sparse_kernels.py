@@ -287,6 +287,7 @@ def compress_k_complete_kernel_new_padded(
     kernel_size: tl.constexpr,
     kernel_stride: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    max_grid_chunks: tl.constexpr,
 ):
     """
     Padded layout version: stores compressed keys in batch-major order.
@@ -294,12 +295,18 @@ def compress_k_complete_kernel_new_padded(
     Output layout: full_compressed_k[batch_idx * max_chunks_per_seq + chunk_idx]
     This allows using reshape() to view per-batch data for debugging.
     
-    Grid: (batch_size, max_total_chunks, head_num_k)
+    Grid: (batch_size, min(max_total_chunks, max_grid_chunks), head_num_k)
     where max_total_chunks = max_chunks_per_seq + max_history_chunks
+    
+    If total_chunks > max_grid_chunks, each thread block loops to handle multiple chunks.
     """
     batch_idx = tl.program_id(0)
-    chunk_in_seq = tl.program_id(1)
+    grid_chunk_idx = tl.program_id(1)
     head_idx = tl.program_id(2)
+    
+    # Total number of chunks this thread block needs to process
+    # Each thread block handles: grid_chunk_idx, grid_chunk_idx + max_grid_chunks, grid_chunk_idx + 2*max_grid_chunks, ...
+    chunk_stride = max_grid_chunks
 
     if batch_idx >= batch_size or head_idx >= head_num_k:
         return
@@ -324,156 +331,164 @@ def compress_k_complete_kernel_new_padded(
     history_chunks_in_seq = history_compress
     total_chunks_in_seq = history_chunks_in_seq + new_chunks_in_seq
 
-    # Skip if this chunk_in_seq doesn't exist
-    if chunk_in_seq >= total_chunks_in_seq:
-        return
+    # ====================================================================
+    # LOOP: Handle multiple chunks per thread block if needed
+    # ====================================================================
+    
+    # Iterate over all chunks assigned to this thread block
+    # chunk_in_seq = grid_chunk_idx, grid_chunk_idx + chunk_stride, grid_chunk_idx + 2*chunk_stride, ...
+    chunk_in_seq = grid_chunk_idx
+    
+    while chunk_in_seq < total_chunks_in_seq:
+        # Skip if this chunk_in_seq doesn't exist
+        # (This check is now inside the loop)
+        
+        # Determine if processing history or new chunks
+        is_history_chunk = chunk_in_seq < history_chunks_in_seq
 
-    # Determine if processing history or new chunks
-    is_history_chunk = chunk_in_seq < history_chunks_in_seq
+        if is_history_chunk:
+            # ====================================================================
+            # PHASE 1: Process HISTORY chunks (PADDED LAYOUT)
+            # ====================================================================
 
-    if is_history_chunk:
-        # ====================================================================
-        # PHASE 1: Process HISTORY chunks (PADDED LAYOUT)
-        # ====================================================================
+            history_chunk_idx = chunk_in_seq
 
-        history_chunk_idx = chunk_in_seq
+            # PADDED: Store at batch-major position
+            global_full_idx = batch_idx * max_chunks_per_seq + history_chunk_idx
 
-        # PADDED: Store at batch-major position
-        global_full_idx = batch_idx * max_chunks_per_seq + history_chunk_idx
+            # Read from compressed_k_table
+            full_compressed_idx = tl.load(compressed_k_table_ptr + batch_idx * compressed_k_table_cols + history_chunk_idx).to(tl.int32)
 
-        # Read from compressed_k_table
-        full_compressed_idx = tl.load(compressed_k_table_ptr + batch_idx * compressed_k_table_cols + history_chunk_idx).to(tl.int32)
+            # Read from key_cache and store to full_compressed_k output
+            key_cache_offset = full_compressed_idx * head_num_k * head_dim
 
-        # Read from key_cache and store to full_compressed_k output
-        key_cache_offset = full_compressed_idx * head_num_k * head_dim
-
-        if head_idx == 0:
-            for h in range(head_num_k):
-                head_offset = key_cache_offset + h * head_dim
-
-                x = tl.load(
-                    key_cache_ptr + head_offset + tl.arange(0, BLOCK_SIZE),
-                    mask=tl.arange(0, BLOCK_SIZE) < head_dim,
-                    other=0.0
-                ).to(tl.float32)
-
-                out_offset = global_full_idx * head_num_k * head_dim + h * head_dim
-                tl.store(
-                    full_compressed_k_ptr + out_offset + tl.arange(0, BLOCK_SIZE),
-                    x,
-                    mask=tl.arange(0, BLOCK_SIZE) < head_dim
-                )
-
-    else:
-        # ====================================================================
-        # PHASE 2: Process NEW chunks
-        # ====================================================================
-
-        new_chunk_idx = chunk_in_seq - history_chunks_in_seq
-        y = new_chunk_idx * kernel_stride + history_compress * k_stride
-
-        if y >= token_table_cols:
-            return
-
-        k_indices = tl.load(token_table_ptr + batch_idx * token_table_cols + y).to(tl.int32)
-        compressed_table_y = new_chunk_idx + history_compress
-
-        if compressed_table_y >= compressed_k_table_cols:
-            return
-
-        new_compressed_k_indices = tl.load(compressed_k_table_ptr + batch_idx * compressed_k_table_cols + compressed_table_y).to(tl.int32)
-
-        # ====================================================================
-        # PHASE 3: Perform mean pooling compression on k
-        # ====================================================================
-
-        acc = tl.zeros([head_dim], dtype=tl.float32)
-
-        for token_offset in range(kernel_size):
-            token_y = (new_chunk_idx * kernel_stride + token_offset) + history_compress * k_stride
-
-            if token_y < token_table_cols:
-                token_k_indices = tl.load(token_table_ptr + batch_idx * token_table_cols + token_y).to(tl.int32)
-            else:
-                token_k_indices = 0
-
-            key_base_offset = token_k_indices * head_num_k * head_dim + head_idx * head_dim
-
-            x = tl.load(
-                key_cache_ptr + key_base_offset + tl.arange(0, BLOCK_SIZE),
-                mask=tl.arange(0, BLOCK_SIZE) < head_dim,
-                other=0.0
-            ).to(tl.float32)
-
-            acc += x
-
-        acc = acc / kernel_size
-
-        # ====================================================================
-        # PHASE 4: Store compressed result to key_cache (head 0 only)
-        # ====================================================================
-
-        if head_idx == 0:
-            key_cache_offset = new_compressed_k_indices * head_num_k * head_dim
-
-            for h in range(head_num_k):
-                head_acc = tl.zeros([head_dim], dtype=tl.float32)
-
-                for token_offset in range(kernel_size):
-                    token_y = (new_chunk_idx * kernel_stride + token_offset) + history_compress * k_stride
-
-                    if token_y < token_table_cols:
-                        token_k_indices = tl.load(token_table_ptr + batch_idx * token_table_cols + token_y).to(tl.int32)
-                    else:
-                        token_k_indices = 0
-
-                    key_base_offset = token_k_indices * head_num_k * head_dim + h * head_dim
+            if head_idx == 0:
+                for h in range(head_num_k):
+                    head_offset = key_cache_offset + h * head_dim
 
                     x = tl.load(
-                        key_cache_ptr + key_base_offset + tl.arange(0, BLOCK_SIZE),
+                        key_cache_ptr + head_offset + tl.arange(0, BLOCK_SIZE),
                         mask=tl.arange(0, BLOCK_SIZE) < head_dim,
                         other=0.0
                     ).to(tl.float32)
 
-                    head_acc += x
+                    out_offset = global_full_idx * head_num_k * head_dim + h * head_dim
+                    tl.store(
+                        full_compressed_k_ptr + out_offset + tl.arange(0, BLOCK_SIZE),
+                        x,
+                        mask=tl.arange(0, BLOCK_SIZE) < head_dim
+                    )
 
-                head_acc = head_acc / kernel_size
+        else:
+            # ====================================================================
+            # PHASE 2: Process NEW chunks
+            # ====================================================================
 
-                head_offset = key_cache_offset + h * head_dim
-                tl.store(
-                    key_cache_ptr + head_offset + tl.arange(0, BLOCK_SIZE),
-                    head_acc,
-                    mask=tl.arange(0, BLOCK_SIZE) < head_dim
-                )
+            new_chunk_idx = chunk_in_seq - history_chunks_in_seq
+            y = new_chunk_idx * kernel_stride + history_compress * k_stride
 
-        # ====================================================================
-        # PHASE 5: Read full_compressed_k from key_cache (PADDED LAYOUT)
-        # ====================================================================
+            # Use nested if instead of continue (Triton doesn't support continue)
+            if y < token_table_cols:
+                k_indices = tl.load(token_table_ptr + batch_idx * token_table_cols + y).to(tl.int32)
+                compressed_table_y = new_chunk_idx + history_compress
 
-        if head_idx == 0:
-            # PADDED: Store at batch-major position
-            global_full_idx = batch_idx * max_chunks_per_seq + history_compress + new_chunk_idx
+                if compressed_table_y < compressed_k_table_cols:
+                    new_compressed_k_indices = tl.load(compressed_k_table_ptr + batch_idx * compressed_k_table_cols + compressed_table_y).to(tl.int32)
 
-            full_table_y = history_compress + new_chunk_idx
-            full_compressed_idx = tl.load(compressed_k_table_ptr + batch_idx * compressed_k_table_cols + full_table_y).to(tl.int32)
+                    # ====================================================================
+                    # PHASE 3: Perform mean pooling compression on k
+                    # ====================================================================
 
-            key_cache_offset = full_compressed_idx * head_num_k * head_dim
+                    acc = tl.zeros([head_dim], dtype=tl.float32)
 
-            for h in range(head_num_k):
-                head_offset = key_cache_offset + h * head_dim
+                    for token_offset in range(kernel_size):
+                        token_y = (new_chunk_idx * kernel_stride + token_offset) + history_compress * k_stride
 
-                x = tl.load(
-                    key_cache_ptr + head_offset + tl.arange(0, BLOCK_SIZE),
-                    mask=tl.arange(0, BLOCK_SIZE) < head_dim,
-                    other=0.0
-                ).to(tl.float32)
+                        if token_y < token_table_cols:
+                            token_k_indices = tl.load(token_table_ptr + batch_idx * token_table_cols + token_y).to(tl.int32)
+                        else:
+                            token_k_indices = 0
 
-                out_offset = global_full_idx * head_num_k * head_dim + h * head_dim
-                tl.store(
-                    full_compressed_k_ptr + out_offset + tl.arange(0, BLOCK_SIZE),
-                    x,
-                    mask=tl.arange(0, BLOCK_SIZE) < head_dim
-                )
+                        key_base_offset = token_k_indices * head_num_k * head_dim + head_idx * head_dim
+
+                        x = tl.load(
+                            key_cache_ptr + key_base_offset + tl.arange(0, BLOCK_SIZE),
+                            mask=tl.arange(0, BLOCK_SIZE) < head_dim,
+                            other=0.0
+                        ).to(tl.float32)
+
+                        acc += x
+
+                    acc = acc / kernel_size
+
+                    # ====================================================================
+                    # PHASE 4: Store compressed result to key_cache (head 0 only)
+                    # ====================================================================
+
+                    if head_idx == 0:
+                        key_cache_offset = new_compressed_k_indices * head_num_k * head_dim
+
+                        for h in range(head_num_k):
+                            head_acc = tl.zeros([head_dim], dtype=tl.float32)
+
+                            for token_offset in range(kernel_size):
+                                token_y = (new_chunk_idx * kernel_stride + token_offset) + history_compress * k_stride
+
+                                if token_y < token_table_cols:
+                                    token_k_indices = tl.load(token_table_ptr + batch_idx * token_table_cols + token_y).to(tl.int32)
+                                else:
+                                    token_k_indices = 0
+
+                                key_base_offset = token_k_indices * head_num_k * head_dim + h * head_dim
+
+                                x = tl.load(
+                                    key_cache_ptr + key_base_offset + tl.arange(0, BLOCK_SIZE),
+                                    mask=tl.arange(0, BLOCK_SIZE) < head_dim,
+                                    other=0.0
+                                ).to(tl.float32)
+
+                                head_acc += x
+
+                            head_acc = head_acc / kernel_size
+
+                            head_offset = key_cache_offset + h * head_dim
+                            tl.store(
+                                key_cache_ptr + head_offset + tl.arange(0, BLOCK_SIZE),
+                                head_acc,
+                                mask=tl.arange(0, BLOCK_SIZE) < head_dim
+                            )
+
+                    # ====================================================================
+                    # PHASE 5: Read full_compressed_k from key_cache (PADDED LAYOUT)
+                    # ====================================================================
+
+                    if head_idx == 0:
+                        # PADDED: Store at batch-major position
+                        global_full_idx = batch_idx * max_chunks_per_seq + history_compress + new_chunk_idx
+
+                        full_table_y = history_compress + new_chunk_idx
+                        full_compressed_idx = tl.load(compressed_k_table_ptr + batch_idx * compressed_k_table_cols + full_table_y).to(tl.int32)
+
+                        key_cache_offset = full_compressed_idx * head_num_k * head_dim
+
+                        for h in range(head_num_k):
+                            head_offset = key_cache_offset + h * head_dim
+
+                            x = tl.load(
+                                key_cache_ptr + head_offset + tl.arange(0, BLOCK_SIZE),
+                                mask=tl.arange(0, BLOCK_SIZE) < head_dim,
+                                other=0.0
+                            ).to(tl.float32)
+
+                            out_offset = global_full_idx * head_num_k * head_dim + h * head_dim
+                            tl.store(
+                                full_compressed_k_ptr + out_offset + tl.arange(0, BLOCK_SIZE),
+                                x,
+                                mask=tl.arange(0, BLOCK_SIZE) < head_dim
+                            )
+        
+        # Move to next chunk for this thread block
+        chunk_in_seq += chunk_stride
 
 
 """Fused CUDA kernel for sparse_page_table to flashinfer format conversion.

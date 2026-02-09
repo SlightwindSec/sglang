@@ -232,8 +232,11 @@ def compress_k_core_new_padded(
     # Must match: batch_size * max_context_length // kernel_stride
     max_chunks_per_seq = max_context_length // kernel_stride
 
+    MAX_GRID_CHUNKS = 1024  # Adjustable limit for grid dimension
+    max_grid_chunks = min(max_chunks_per_seq, MAX_GRID_CHUNKS)
+
     BLOCK_SIZE = triton.next_power_of_2(head_dim)
-    grid = (batch, max_chunks_per_seq, head_num_k)
+    grid = (batch, max_grid_chunks, head_num_k)
 
     compress_k_complete_kernel_new_padded[grid](
         key_cache,
@@ -255,6 +258,7 @@ def compress_k_core_new_padded(
         kernel_size,
         kernel_stride,
         BLOCK_SIZE,
+        max_grid_chunks,
     )
     return
 
