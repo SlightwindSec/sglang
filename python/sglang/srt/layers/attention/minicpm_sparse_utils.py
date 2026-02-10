@@ -366,11 +366,11 @@ def allocate_and_compress_keys(
             layer.device if hasattr(layer, "device") else torch.cuda.current_device()
         )
 
-    full_compressed_k1 = torch.zeros(
-        (k1_token_nums, layer.tp_k_head_num, layer.head_dim), dtype=dtype, device=device
+    full_compressed_k1 = torch.full(
+        (k1_token_nums, layer.tp_k_head_num, layer.head_dim), dtype=dtype, device=device, fill_value=float('-inf')
     )
-    full_compressed_k2 = torch.zeros(
-        (k2_token_nums, layer.tp_k_head_num, layer.head_dim), dtype=dtype, device=device
+    full_compressed_k2 = torch.full(
+        (k2_token_nums, layer.tp_k_head_num, layer.head_dim), dtype=dtype, device=device, fill_value=float('-inf')
     )
 
     if split_stage1:
