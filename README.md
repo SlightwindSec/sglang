@@ -90,6 +90,8 @@ python3 -m sglang.launch_server \
 | `--port 31111` | Server port |
 | `--dense-as-sparse` | Use dense-as-sparse mode |
 
+> **Tip:** For best generation quality, we recommend setting `temperature=0.9` when sending requests to the server.
+
 ## Directory Structure
 
 ```
