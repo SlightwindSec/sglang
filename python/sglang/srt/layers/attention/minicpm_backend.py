@@ -819,6 +819,9 @@ class MiniCPMSparseBackend(AttentionBackend):
                 seq_lens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
                 seq_lens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
                 cache_lens = seq_lens_k - seq_lens_q
+        else:
+            batch_size = cu_seqlens_q.shape[0] - 1
+            cache_lens = torch.zeros(batch_size, dtype=torch.int32, device=cu_seqlens_q.device)
 
         if not self.fuse_topk:
             topk_idx = compressed_attention(
