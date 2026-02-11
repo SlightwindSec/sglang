@@ -18,7 +18,7 @@
 >
 > **Environment Dependencies:**
 > This project is designed to work in conjunction with the following repositories to form the complete runtime environment:
-> 1. **InfLLM V2 CUDA Kernels**: [OpenBMB/infllmv2_cuda_impl](https://github.com/OpenBMB/infllmv2_cuda_impl/tree/minicpm_sala) (branch: `minicpm_sala`)
+> 1. **InfLLM V2 CUDA Kernels**: [OpenBMB/infllmv2_cuda_impl](https://github.com/OpenBMB/infllmv2_cuda_impl/tree/minicpm_sala) (included as submodule, branch: `minicpm_sala`)
 > 2. **Sparse Kernels**: [OpenBMB/sparse_kernel](https://github.com/OpenBMB/sparse_kernel) (included as submodule)
 
 --------------------------------------------------------------------------------

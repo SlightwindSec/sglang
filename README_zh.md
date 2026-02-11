@@ -18,7 +18,7 @@
 >
 > **环境依赖:**
 > 本项目需要配合以下仓库共同构成完整的运行环境：
-> 1. **InfLLM V2 CUDA Kernels**: [OpenBMB/infllmv2_cuda_impl](https://github.com/OpenBMB/infllmv2_cuda_impl/tree/minicpm_sala) (分支: `minicpm_sala`)
+> 1. **InfLLM V2 CUDA Kernels**: [OpenBMB/infllmv2_cuda_impl](https://github.com/OpenBMB/infllmv2_cuda_impl/tree/minicpm_sala) (已包含为 submodule，分支: `minicpm_sala`)
 > 2. **Sparse Kernels**: [OpenBMB/sparse_kernel](https://github.com/OpenBMB/sparse_kernel) (已包含为 submodule)
 
 --------------------------------------------------------------------------------

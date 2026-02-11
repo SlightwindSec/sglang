@@ -25,23 +25,9 @@ if ! command -v uv &> /dev/null; then
     exit 1
 fi
 
-# ---- Prepare Dependencies ----
-mkdir -p "${DEPS_DIR}"
-
-# 1. infllmv2_cuda_impl
-if [ ! -d "${DEPS_DIR}/infllmv2_cuda_impl" ]; then
-    echo "[0/4] Cloning infllmv2_cuda_impl..."
-    git clone -b minicpm_sala https://github.com/OpenBMB/infllmv2_cuda_impl.git "${DEPS_DIR}/infllmv2_cuda_impl"
-else
-    echo "[0/4] infllmv2_cuda_impl already exists, skipping"
-fi
-
-# 2. sparse_kernel
-# (Managed as git submodule)
-if [ ! -d "${DEPS_DIR}/sparse_kernel/.git" ]; then
-    echo "[0/4] Initializing sparse_kernel submodule..."
-    git submodule update --init --recursive "${DEPS_DIR}/sparse_kernel"
-fi
+# ---- Prepare Dependencies (via git submodule) ----
+echo "[0/4] Initializing submodules (infllmv2_cuda_impl, sparse_kernel)..."
+git submodule update --init --recursive
 
 # ---- Create venv ----
 if [ -d "${VENV_DIR}" ]; then
@@ -94,7 +80,7 @@ echo "[3/4] Building CUDA kernels..."
 # infllm_v2
 echo "  - Installing infllm_v2..."
 cd "${DEPS_DIR}/infllmv2_cuda_impl"
-# 即使之前 clone 过，也确保 submodule 是最新的
+# infllmv2_cuda_impl has its own submodules (e.g. cutlass)
 git submodule update --init --recursive
 python setup.py install
 
