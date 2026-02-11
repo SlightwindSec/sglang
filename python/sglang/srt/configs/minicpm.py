@@ -15,7 +15,7 @@ class MiniCPMHybridConfig(PretrainedConfig):
     and provides cache parameters for the Simple GLA attention mechanism.
     """
 
-    model_type = "minicpm"
+    model_type = "minicpm_sala"
 
     def __init__(
         self,
