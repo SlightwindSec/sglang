@@ -1,0 +1,3 @@
+[submodule "3rdparty/sparse_kernel"]
+	path = 3rdparty/sparse_kernel
+	url = https://github.com/GitHubstart0916/sparse_kernel.git

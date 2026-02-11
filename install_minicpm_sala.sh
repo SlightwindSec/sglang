@@ -37,11 +37,10 @@ else
 fi
 
 # 2. sparse_kernel
-if [ ! -d "${DEPS_DIR}/sparse_kernel" ]; then
-    echo "[0/4] Cloning sparse_kernel..."
-    git clone https://github.com/GitHubstart0916/sparse_kernel.git "${DEPS_DIR}/sparse_kernel"
-else
-    echo "[0/4] sparse_kernel already exists, skipping"
+# (Managed as git submodule)
+if [ ! -d "${DEPS_DIR}/sparse_kernel/.git" ]; then
+    echo "[0/4] Initializing sparse_kernel submodule..."
+    git submodule update --init --recursive "${DEPS_DIR}/sparse_kernel"
 fi
 
 # ---- Create venv ----
