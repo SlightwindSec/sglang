@@ -19,7 +19,7 @@
 > **环境依赖:**
 > 本项目需要配合以下仓库共同构成完整的运行环境：
 > 1. **InfLLM V2 CUDA Kernels**: [OpenBMB/infllmv2_cuda_impl](https://github.com/OpenBMB/infllmv2_cuda_impl/tree/minicpm_sala) (分支: `minicpm_sala`)
-> 2. **Sparse Kernels**: [GitHubstart0916/sparse_kernel](https://github.com/GitHubstart0916/sparse_kernel)
+> 2. **Sparse Kernels**: [GitHubstart0916/sparse_kernel](https://github.com/GitHubstart0916/sparse_kernel) (已包含为 submodule)
 
 --------------------------------------------------------------------------------
 
@@ -52,7 +52,7 @@ bash install_minicpm_sala.sh https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simpl
 安装脚本会自动完成以下步骤：
 
 1. 创建 `sglang_minicpm_sala_env` 虚拟环境（Python 3.12）
-2. 克隆依赖到 `3rdparty/` 目录
+2. 克隆依赖到 `3rdparty/` 目录 (infllmv2) 并初始化子模块 (sparse_kernel)
 3. 安装 MiniCPM-SALA (当前仓库)
 4. 编译安装 `infllmv2_cuda_impl`
 5. 编译安装 `sparse_kernel`

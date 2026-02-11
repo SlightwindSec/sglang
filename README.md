@@ -19,7 +19,7 @@
 > **Environment Dependencies:**
 > This project is designed to work in conjunction with the following repositories to form the complete runtime environment:
 > 1. **InfLLM V2 CUDA Kernels**: [OpenBMB/infllmv2_cuda_impl](https://github.com/OpenBMB/infllmv2_cuda_impl/tree/minicpm_sala) (branch: `minicpm_sala`)
-> 2. **Sparse Kernels**: [GitHubstart0916/sparse_kernel](https://github.com/GitHubstart0916/sparse_kernel)
+> 2. **Sparse Kernels**: [GitHubstart0916/sparse_kernel](https://github.com/GitHubstart0916/sparse_kernel) (included as submodule)
 
 --------------------------------------------------------------------------------
 
@@ -52,7 +52,7 @@ bash install_minicpm_sala.sh https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simpl
 The installation script performs the following steps:
 
 1. Creates `sglang_minicpm_sala_env` virtual environment (Python 3.12)
-2. Clones dependencies to `3rdparty/`
+2. Clones dependencies to `3rdparty/` (infllmv2) and initializes submodules (sparse_kernel)
 3. Installs MiniCPM-SALA (current repo)
 4. Compiles and installs `infllmv2_cuda_impl`
 5. Compiles and installs `sparse_kernel`
