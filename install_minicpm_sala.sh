@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# 获取脚本所在目录（即 sglang 仓库根目录）
+# Get the directory where this script resides (i.e., the sglang repo root)
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${REPO_ROOT}/sglang_minicpm_sala_env"
 DEPS_DIR="${REPO_ROOT}/3rdparty"
@@ -74,20 +74,18 @@ fi
 
 # ---- Install Packages ----
 
-# 1. Install sglang (Current Directory)
+# Install sglang from the repo root
 echo "[2/4] Installing sglang (current directory)..."
 uv pip install "cmake>=3.26"
 uv pip install --upgrade pip setuptools wheel
-# 安装当前目录 (sglang)
 uv pip install -e "${REPO_ROOT}/python[all]"
 
-# 2. Install Dependencies
+# Build and install CUDA kernel dependencies
 echo "[3/4] Building CUDA kernels..."
 
-# infllm_v2
+# infllm_v2 (has its own submodules, e.g. cutlass)
 echo "  - Installing infllm_v2..."
 cd "${DEPS_DIR}/infllmv2_cuda_impl"
-# infllmv2_cuda_impl has its own submodules (e.g. cutlass)
 git submodule update --init --recursive
 python setup.py install
 
@@ -96,11 +94,11 @@ echo "  - Installing sparse_kernel..."
 cd "${DEPS_DIR}/sparse_kernel"
 python setup.py install
 
-# 3. Install Additional Libraries
+# Install additional libraries
 echo "[4/4] Installing additional libraries..."
 uv pip install tilelang flash-linear-attention
 
-# ---- Verify ----
+# ---- Done ----
 echo ""
 echo "============================================"
 echo " Installation complete!"
