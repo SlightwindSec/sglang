@@ -561,7 +561,7 @@ class MiniCPMModel(nn.Module):
         return hidden_states
 
 
-class MiniCPMForCausalLM(nn.Module):
+class MiniCPMSALAForCausalLM(nn.Module):
     def __init__(
         self,
         config,
@@ -669,7 +669,4 @@ class MiniCPMForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
-class MiniCPMSALACausalLM(MiniCPMForCausalLM):
-    pass
-
-EntryClass = [MiniCPMForCausalLM, MiniCPMSALACausalLM]
+EntryClass = [MiniCPMSALAForCausalLM]
