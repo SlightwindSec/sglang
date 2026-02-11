@@ -29,19 +29,26 @@ fi
 echo "[0/4] Initializing submodules (infllmv2_cuda_impl, sparse_kernel)..."
 git submodule update --init --recursive
 
+# ---- Ensure uv-managed Python ----
+REQUIRED_PY="3.12"
+echo "[1/4] Ensuring Python ${REQUIRED_PY} is managed by uv..."
+uv python install "${REQUIRED_PY}"
+UV_PYTHON=$(uv python find --python-preference only-managed "${REQUIRED_PY}")
+echo "  uv-managed Python: ${UV_PYTHON} ($(${UV_PYTHON} --version))"
+
 # ---- Create venv ----
 if [ -d "${VENV_DIR}" ]; then
     VENV_PY_VER=$("${VENV_DIR}/bin/python" --version 2>&1 | awk '{print $2}')
-    if [[ "${VENV_PY_VER}" != 3.12.* ]]; then
-        echo "[1/4] venv exists but Python version is ${VENV_PY_VER} (expected 3.12.x), recreating..."
+    if [[ "${VENV_PY_VER}" != ${REQUIRED_PY}.* ]]; then
+        echo "  venv exists but Python version is ${VENV_PY_VER} (expected ${REQUIRED_PY}.x), recreating..."
         rm -rf "${VENV_DIR}"
-        uv venv --python 3.12 "${VENV_DIR}"
+        uv venv --python "${UV_PYTHON}" "${VENV_DIR}"
     else
-        echo "[1/4] venv already exists (Python ${VENV_PY_VER}), skipping"
+        echo "  venv already exists (Python ${VENV_PY_VER}), skipping"
     fi
 else
-    echo "[1/4] Creating virtual environment (Python 3.12)..."
-    uv venv --python 3.12 "${VENV_DIR}"
+    echo "  Creating virtual environment..."
+    uv venv --python "${UV_PYTHON}" "${VENV_DIR}"
 fi
 
 # Activate environment variables for the script execution
