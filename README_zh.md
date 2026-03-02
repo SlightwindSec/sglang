@@ -92,6 +92,55 @@ python3 -m sglang.launch_server \
 
 > **提示：** 为获得最佳生成效果，建议在请求时设置 `temperature=0.9`。
 
+### 工具调用（Tool Calling）
+
+启动服务时添加 `--tool-call-parser minicpm4_xml` 参数即可启用工具调用：
+
+```bash
+# 激活环境
+source sglang_minicpm_sala_env/bin/activate
+
+# 启动推理服务（启用工具调用，将 MODEL_PATH 替换为实际模型路径）
+MODEL_PATH=/path/to/your/model
+
+python3 -m sglang.launch_server \
+    --model ${MODEL_PATH} \
+    --trust-remote-code \
+    --disable-radix-cache \
+    --attention-backend minicpm_flashinfer \
+    --chunked-prefill-size 8192 \
+    --max-running-requests 32 \
+    --skip-server-warmup \
+    --port 31111 \
+    --dense-as-sparse \
+    --tool-call-parser minicpm4_xml
+```
+
+**请求示例：**
+
+```bash
+curl -X POST "http://localhost:31111/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "minicpm4.6-8b",
+    "messages": [{"role": "user", "content": "北京天气怎么样"}],
+    "chat_template_kwargs": {"enable_thinking": false},
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "查询天气",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {"type": "string"}
+          }
+        }
+      }
+    }]
+  }'
+```
+
 ## 目录结构
 
 ```

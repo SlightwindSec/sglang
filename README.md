@@ -92,6 +92,55 @@ python3 -m sglang.launch_server \
 
 > **Tip:** For best generation quality, we recommend setting `temperature=0.9` when sending requests to the server.
 
+### Tool Calling
+
+To enable tool calling, add `--tool-call-parser minicpm4_xml` when launching the server:
+
+```bash
+# Activate environment
+source sglang_minicpm_sala_env/bin/activate
+
+# Launch Inference Server with Tool Calling (Replace MODEL_PATH with actual path)
+MODEL_PATH=/path/to/your/model
+
+python3 -m sglang.launch_server \
+    --model ${MODEL_PATH} \
+    --trust-remote-code \
+    --disable-radix-cache \
+    --attention-backend minicpm_flashinfer \
+    --chunked-prefill-size 8192 \
+    --max-running-requests 32 \
+    --skip-server-warmup \
+    --port 31111 \
+    --dense-as-sparse \
+    --tool-call-parser minicpm4_xml
+```
+
+**Example Request:**
+
+```bash
+curl -X POST "http://localhost:31111/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "minicpm4.6-8b",
+    "messages": [{"role": "user", "content": "北京天气怎么样"}],
+    "chat_template_kwargs": {"enable_thinking": false},
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "查询天气",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {"type": "string"}
+          }
+        }
+      }
+    }]
+  }'
+```
+
 ## Directory Structure
 
 ```

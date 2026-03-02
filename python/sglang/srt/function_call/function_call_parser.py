@@ -22,6 +22,7 @@ from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mimo_detector import MiMoDetector
 from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
+from sglang.srt.function_call.minicpm4_xml_detector import MiniCPM4XmlFormatDetector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
@@ -59,6 +60,7 @@ class FunctionCallParser:
         "qwen3_coder": Qwen3CoderDetector,
         "step3": Step3Detector,
         "minimax-m2": MinimaxM2Detector,
+        "minicpm4_xml": MiniCPM4XmlFormatDetector,
         "interns1": InternlmDetector,
     }
 
